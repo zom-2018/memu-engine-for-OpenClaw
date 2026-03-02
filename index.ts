@@ -5,6 +5,11 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 
+type PythonBootstrapResult = {
+  ok: boolean;
+  reason?: string;
+};
+
 const memuEnginePlugin = {
   id: "memu-engine",
   name: "memU Agentic Engine",
@@ -12,6 +17,64 @@ const memuEnginePlugin = {
 
   register(api: OpenClawPluginApi) {
     const pythonRoot = path.join(__dirname, "python");
+    let pythonBootstrapResult: PythonBootstrapResult | null = null;
+
+    const ensurePythonRuntime = (): PythonBootstrapResult => {
+      if (pythonBootstrapResult) return pythonBootstrapResult;
+
+      try {
+        execFileSync("uv", ["--version"], { stdio: "ignore" });
+      } catch {
+        pythonBootstrapResult = {
+          ok: false,
+          reason:
+            "`uv` is required but not found in PATH. Install uv first: https://docs.astral.sh/uv/",
+        };
+        return pythonBootstrapResult;
+      }
+
+      try {
+        // Ensure an isolated runtime and dependency set for this plugin.
+        // This avoids relying on system python (often 3.10) and prevents ABI mismatches.
+        execFileSync("uv", ["sync", "--project", pythonRoot, "--frozen"], {
+          cwd: pythonRoot,
+          env: {
+            ...process.env,
+            UV_LINK_MODE: process.env.UV_LINK_MODE || "copy",
+          },
+          stdio: "ignore",
+        });
+
+        // Validate runtime compatibility up front (MemU requires Python >= 3.11).
+        execFileSync(
+          "uv",
+          [
+            "run",
+            "--project",
+            pythonRoot,
+            "python",
+            "-c",
+            "import sys; assert sys.version_info >= (3, 11), sys.version; import memu",
+          ],
+          {
+            cwd: pythonRoot,
+            stdio: "ignore",
+          }
+        );
+
+        pythonBootstrapResult = { ok: true };
+        return pythonBootstrapResult;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        pythonBootstrapResult = {
+          ok: false,
+          reason:
+            "Failed to bootstrap isolated Python runtime via `uv sync --project python --frozen`. " +
+            `Detail: ${msg}`,
+        };
+        return pythonBootstrapResult;
+      }
+    };
 
     const computeExtraPaths = (pluginConfig: any, workspaceDir: string): string[] => {
       const ingestConfig = pluginConfig?.ingest || {};
@@ -211,6 +274,17 @@ const memuEnginePlugin = {
 
     const killSyncPid = (pid: number) => {
       if (!Number.isFinite(pid) || pid <= 1) return;
+      if (process.platform === "win32") {
+        try {
+          execFileSync("taskkill", ["/PID", String(pid), "/F", "/T"], {
+            stdio: "ignore",
+          });
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
       try {
         process.kill(-pid, "SIGTERM");
       } catch {
@@ -244,10 +318,12 @@ const memuEnginePlugin = {
       }
 
       const scriptPath = path.join(pythonRoot, "watch_sync.py");
-      try {
-        execFileSync("pkill", ["-f", scriptPath], { stdio: "ignore" });
-      } catch {
-        // ignore
+      if (process.platform !== "win32") {
+        try {
+          execFileSync("pkill", ["-f", scriptPath], { stdio: "ignore" });
+        } catch {
+          // ignore
+        }
       }
 
       try {
@@ -291,6 +367,12 @@ const memuEnginePlugin = {
 
     const startSyncService = (pluginConfig: any, workspaceDir: string) => {
       if (syncProcess) return; // Already running
+
+      const pyReady = ensurePythonRuntime();
+      if (!pyReady.ok) {
+        console.error(`[memU] Python bootstrap failed: ${pyReady.reason}`);
+        return;
+      }
 
       const dataDir = getMemuDataDir(pluginConfig);
       lastDataDirForCleanup = dataDir;
@@ -413,10 +495,21 @@ const memuEnginePlugin = {
       return null;
     };
 
+    const isGatewayContext = (): boolean => {
+      const argv = process.argv.slice(2).map((v) => String(v).toLowerCase());
+      const subcommands = argv.filter((a) => !a.startsWith("-"));
+      if (subcommands.length === 0) return true; // bare `openclaw`
+      return subcommands[0] === "gateway";
+    };
+
     let autoStartTriggered = false;
     const triggerAutoStart = () => {
       if (autoStartTriggered) return;
       autoStartTriggered = true;
+
+      if (!isGatewayContext()) {
+        return;
+      }
 
       const mgmtCmd = getGatewayManagementCommand();
       if (mgmtCmd) {
@@ -437,7 +530,7 @@ const memuEnginePlugin = {
         try {
           const pluginConfig = api.pluginConfig || {};
           // Determine workspace dir from common locations
-          const home = process.env.HOME || "";
+          const home = os.homedir();
           const workspaceCandidates = [
             process.env.OPENCLAW_WORKSPACE_DIR,
             path.join(home, ".openclaw", "workspace"),
@@ -509,6 +602,11 @@ const memuEnginePlugin = {
       pluginConfig: any,
       workspaceDir: string,
     ): Promise<string> => {
+      const pyReady = ensurePythonRuntime();
+      if (!pyReady.ok) {
+        return `Error: memU Python bootstrap failed. ${pyReady.reason || "unknown reason"}`;
+      }
+
       // Key point: Trigger background service here (lazy singleton)
       startSyncService(pluginConfig, workspaceDir);
 

@@ -29,8 +29,9 @@ It listens to OpenClaw's session logs and workspace documents, incrementally ext
 
 ### Prerequisites
 
-- `python >= 3.11`
-- `uv` available in `PATH` (the plugin invokes `uv run --project python ...`)
+- `uv` available in `PATH` (the plugin auto-bootstraps an isolated Python runtime via `uv sync`)
+
+> First run auto-bootstrap: the plugin will create/use an isolated environment under `python/.venv` and install locked dependencies from `python/uv.lock`. This applies to both npm install and GitHub source install.
 
 ### 1. Install plugin
 

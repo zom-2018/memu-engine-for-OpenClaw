@@ -29,8 +29,9 @@
 
 ### 前置条件
 
-- `python >= 3.11`
-- `uv` 在 `PATH` 中可用（插件内部使用 `uv run --project python ...`）
+- `uv` 在 `PATH` 中可用（插件会通过 `uv sync` 自动自举独立 Python 运行时）
+
+> 首次运行自动自举：插件会在 `python/.venv` 下创建/复用独立环境，并按 `python/uv.lock` 安装锁定依赖。npm 安装与 GitHub 源码安装都走同一逻辑。
 
 ### 1. 安装插件
 
