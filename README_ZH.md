@@ -9,7 +9,31 @@
 
 - [English](README.md)
 
-## 0.2.1 更新（简要）
+## 最新更新
+
+### v0.2.6 - SecretRef 支持 & Issue #7 修复
+
+- ✅ **完整支持 OpenClaw 的 `${VAR}` 环境变量语法**（修复了 [Issue #7](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/issues/7)）
+- ✅ 支持 SecretRef 对象（`env` source）
+- ✅ 向后兼容明文 API key（会显示安全警告）
+- ✅ 自动回退到环境变量（`MEMU_EMBED_API_KEY`、`MEMU_CHAT_API_KEY`）
+
+**推荐的 API Key 配置方式：**
+```jsonc
+{
+  "embedding": {
+    "apiKey": "${OPENAI_API_KEY}"  // 可以安全地提交到 git！
+  }
+}
+```
+
+一次性设置环境变量：
+```bash
+echo 'export OPENAI_API_KEY="sk-your-key"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### v0.2.1 更新（简要）
 
 - `memory_search` 默认改为 **compact 输出**，减少主模型读取的冗余字段。
 - 新增检索配置：`mode`（`fast`/`full`）、`contextMessages`、`defaultCategoryQuota`、`defaultItemQuota`、`outputMode`。
@@ -119,6 +143,61 @@ openclaw gateway restart
 配置用于生成文本向量的模型，直接决定搜索的准确性。
 *   **推荐**：`text-embedding-3-small` (OpenAI) 或 `bge-m3` (本地/SiliconFlow)。
 *   支持所有 OpenAI 兼容接口。
+
+**API Key 配置（推荐方式）：**
+
+使用环境变量模板语法 - **最安全、最方便**的配置方式：
+
+```jsonc
+"embedding": {
+  "provider": "openai",
+  "baseUrl": "https://api.openai.com/v1",
+  "apiKey": "${OPENAI_API_KEY}",  // 引用环境变量
+  "model": "text-embedding-3-small"
+}
+```
+
+**设置步骤（一次性）：**
+```bash
+# 添加到 shell 配置文件（永久生效）
+echo 'export OPENAI_API_KEY="sk-your-actual-key"' >> ~/.bashrc
+source ~/.bashrc
+
+# 验证
+echo $OPENAI_API_KEY
+```
+
+**为什么这样安全：**
+- ✅ 配置文件只包含变量名 `"${OPENAI_API_KEY}"` - 可以安全提交到 git
+- ✅ 实际的 API key 保存在环境变量中 - 不会暴露在配置文件中
+- ✅ 不同环境（开发/生产）可以使用不同的密钥
+- ✅ 符合 12-Factor App 最佳实践
+
+**其他配置方式：**
+
+<details>
+<summary>点击展开：其他配置选项</summary>
+
+**完整 SecretRef 对象**（等同于 `${VAR}` 语法）：
+```jsonc
+"apiKey": {
+  "source": "env",
+  "provider": "default",
+  "id": "OPENAI_API_KEY"
+}
+```
+
+**明文 API key**（不推荐，会显示安全警告）：
+```jsonc
+"apiKey": "sk-..."  // ⚠️ 不安全 - 提交到 git 可能泄露
+```
+
+**环境变量回退**（自动）：
+如果未配置 `apiKey`，插件会自动尝试从 `MEMU_EMBED_API_KEY` 环境变量读取。
+
+**注意：** 目前仅支持 `env` source。`file` 和 `exec` source 需要完整的 OpenClaw SDK 集成。
+
+</details>
 
 ### 2. `extraction` (提取模型)
 配置用于阅读对话日志并提取记忆条目的 LLM。

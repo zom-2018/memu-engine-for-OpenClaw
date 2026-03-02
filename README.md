@@ -9,7 +9,31 @@ Language:
 
 - [Chinese (中文)](README_ZH.md)
 
-## 0.2.1 Update (quick notes)
+## Latest Updates
+
+### v0.2.6 - SecretRef Support & Issue #7 Fix
+
+- ✅ **Full support for OpenClaw's `${VAR}` environment variable syntax** (fixes [Issue #7](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/issues/7))
+- ✅ Support for SecretRef objects with `env` source
+- ✅ Backward compatible with plain text API keys (with security warnings)
+- ✅ Automatic fallback to environment variables (`MEMU_EMBED_API_KEY`, `MEMU_CHAT_API_KEY`)
+
+**Recommended API Key Configuration:**
+```jsonc
+{
+  "embedding": {
+    "apiKey": "${OPENAI_API_KEY}"  // Safe to commit to git!
+  }
+}
+```
+
+Set environment variable once:
+```bash
+echo 'export OPENAI_API_KEY="sk-your-key"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### v0.2.1 Update (quick notes)
 
 - `memory_search` now supports **compact output** (default) to reduce model token usage.
 - Added retrieval controls in config: `mode` (`fast`/`full`), `contextMessages`, `defaultCategoryQuota`, `defaultItemQuota`, `outputMode`.
@@ -119,6 +143,61 @@ Below is a complete configuration example with parameter explanations. It is rec
 Configures the model used for generating text vectors, which directly determines search accuracy.
 *   **Recommended**: `text-embedding-3-small` (OpenAI) or `bge-m3` (local/SiliconFlow).
 *   Supports all OpenAI-compatible interfaces.
+
+**API Key Configuration (Recommended):**
+
+Use environment variable template syntax - the **safest and most convenient** way:
+
+```jsonc
+"embedding": {
+  "provider": "openai",
+  "baseUrl": "https://api.openai.com/v1",
+  "apiKey": "${OPENAI_API_KEY}",  // References environment variable
+  "model": "text-embedding-3-small"
+}
+```
+
+**Setup (one-time):**
+```bash
+# Add to your shell config (permanent)
+echo 'export OPENAI_API_KEY="sk-your-actual-key"' >> ~/.bashrc
+source ~/.bashrc
+
+# Verify
+echo $OPENAI_API_KEY
+```
+
+**Why this is secure:**
+- ✅ Config file only contains variable name `"${OPENAI_API_KEY}"` - safe to commit to git
+- ✅ Actual API key stays in environment variable - never exposed in config files
+- ✅ Different environments (dev/prod) can use different keys
+- ✅ Follows 12-Factor App best practices
+
+**Alternative Configuration Methods:**
+
+<details>
+<summary>Click to expand: Other configuration options</summary>
+
+**Full SecretRef Object** (equivalent to `${VAR}` syntax):
+```jsonc
+"apiKey": {
+  "source": "env",
+  "provider": "default",
+  "id": "OPENAI_API_KEY"
+}
+```
+
+**Plain Text** (not recommended, shows security warning):
+```jsonc
+"apiKey": "sk-..."  // ⚠️ Insecure - may leak if committed to git
+```
+
+**Environment Variable Fallback** (automatic):
+If no `apiKey` is configured, the plugin automatically reads from `MEMU_EMBED_API_KEY` environment variable.
+
+**Note:** Currently only `env` source is supported. `file` and `exec` sources require full OpenClaw SDK integration.
+
+</details>
 
 ### 2. `extraction` (Extraction Model)
 Configures the LLM used for reading conversation logs and extracting memory items.

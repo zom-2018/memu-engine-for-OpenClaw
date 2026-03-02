@@ -5,6 +5,203 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 
+// ============================================================================
+// SecretRef Types (aligned with OpenClaw SDK)
+// ============================================================================
+type SecretRefSource = "env" | "file" | "exec";
+
+type SecretRef = {
+  source: SecretRefSource;
+  provider: string;
+  id: string;
+};
+
+type SecretInput = string | SecretRef;
+
+function isSecretRef(value: unknown): value is SecretRef {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "source" in value &&
+    "provider" in value &&
+    "id" in value &&
+    typeof (value as any).source === "string" &&
+    typeof (value as any).provider === "string" &&
+    typeof (value as any).id === "string"
+  );
+}
+
+// ============================================================================
+// SecretRef Resolution Helpers
+// ============================================================================
+
+// Track warnings to avoid duplicate messages (only warn once per session)
+const warnedPlaintextKeys = new Set<string>();
+const warnedSecretRefFailures = new Set<string>();
+
+// Regex to match OpenClaw's env template syntax: ${VAR_NAME}
+// Matches uppercase letters, digits, and underscores (1-128 chars)
+const ENV_SECRET_TEMPLATE_RE = /^\$\{([A-Z][A-Z0-9_]{0,127})\}$/;
+
+/**
+ * Parse OpenClaw's simplified env template syntax: "${VAR_NAME}"
+ * Returns a SecretRef object if the string matches the pattern, null otherwise.
+ * 
+ * Example: "${OPENAI_API_KEY}" -> {source: "env", provider: "default", id: "OPENAI_API_KEY"}
+ */
+function parseEnvTemplateSecretRef(value: unknown): SecretRef | null {
+  if (typeof value !== "string") return null;
+  const match = ENV_SECRET_TEMPLATE_RE.exec(value.trim());
+  if (!match) return null;
+  return {
+    source: "env",
+    provider: "default",
+    id: match[1],
+  };
+}
+
+/**
+ * Resolve a SecretInput (string or SecretRef) to a plain string.
+ * For SecretRef, attempts basic resolution based on source type.
+ * Returns undefined if input is undefined or resolution fails.
+ * 
+ * Supports three input formats:
+ * 1. Plain string: "sk-..." (backward compatible)
+ * 2. Env template: "${OPENAI_API_KEY}" (OpenClaw simplified syntax)
+ * 3. Full SecretRef: {source: "env", provider: "default", id: "OPENAI_API_KEY"}
+ */
+async function resolveMaybeSecretString(
+  input: SecretInput | undefined,
+  context: { keyName: string; envFallback?: string }
+): Promise<{ value: string; source: "plaintext" | "secretref" | "env-template" | "env-fallback" } | undefined> {
+  if (!input) {
+    return undefined;
+  }
+
+  // Case 1: Check for env template syntax first (before treating as plain string)
+  if (typeof input === "string") {
+    const envTemplate = parseEnvTemplateSecretRef(input);
+    if (envTemplate) {
+      // Treat as SecretRef
+      try {
+        const resolved = await resolveSecretRef(envTemplate);
+        if (resolved) {
+          return { value: resolved, source: "env-template" };
+        }
+      } catch (error) {
+        const refKey = `${envTemplate.source}:${envTemplate.provider}:${envTemplate.id}`;
+        if (!warnedSecretRefFailures.has(refKey)) {
+          console.warn(
+            `[memu-engine] Failed to resolve env template for ${context.keyName}: ${input}. ` +
+            `Error: ${error instanceof Error ? error.message : String(error)}. ` +
+            (context.envFallback ? `Falling back to environment variable ${context.envFallback}.` : "No fallback available.")
+          );
+          warnedSecretRefFailures.add(refKey);
+        }
+        // Fall through to return undefined (will trigger fallback)
+      }
+      return undefined;
+    }
+    
+    // Not an env template, treat as plain string
+    return { value: input, source: "plaintext" };
+  }
+
+  // Case 2: Full SecretRef object - attempt resolution
+  if (isSecretRef(input)) {
+    try {
+      const resolved = await resolveSecretRef(input);
+      if (resolved) {
+        return { value: resolved, source: "secretref" };
+      }
+    } catch (error) {
+      const refKey = `${input.source}:${input.provider}:${input.id}`;
+      if (!warnedSecretRefFailures.has(refKey)) {
+        console.warn(
+          `[memu-engine] Failed to resolve SecretRef for ${context.keyName}: ${refKey}. ` +
+          `Error: ${error instanceof Error ? error.message : String(error)}. ` +
+          (context.envFallback ? `Falling back to environment variable ${context.envFallback}.` : "No fallback available.")
+        );
+        warnedSecretRefFailures.add(refKey);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Basic SecretRef resolver (simplified version without full OpenClaw config dependency).
+ * Supports env source only for now. File and exec sources would require full SDK integration.
+ */
+async function resolveSecretRef(ref: SecretRef): Promise<string | undefined> {
+  if (ref.source === "env") {
+    // For env source, the 'id' field contains the environment variable name
+    const value = process.env[ref.id];
+    if (value) {
+      return value;
+    }
+    throw new Error(`Environment variable ${ref.id} not found`);
+  }
+
+  // File and exec sources require full OpenClaw SDK integration
+  // For now, we don't support them in this simplified implementation
+  throw new Error(
+    `SecretRef source '${ref.source}' is not supported yet. ` +
+    `Only 'env' source is currently supported. ` +
+    `Please use environment variables or plain text API keys.`
+  );
+}
+
+/**
+ * Resolve API key with fallback priority:
+ * 1. Config value (SecretRef or plaintext)
+ * 2. Environment variable (if provided)
+ * 3. Empty string (will cause Python script to fail with clear error)
+ */
+async function resolveApiKeyWithFallback(
+  configValue: SecretInput | undefined,
+  envVarName: string,
+  keyName: string
+): Promise<string> {
+  // Try to resolve from config (SecretRef or plaintext)
+  const resolved = await resolveMaybeSecretString(configValue, {
+    keyName,
+    envFallback: envVarName,
+  });
+
+  if (resolved) {
+    // Warn about plaintext API keys (only once per key pattern)
+    // Don't warn for env-template or secretref (those are secure)
+    if (resolved.source === "plaintext" && resolved.value) {
+      const keyPattern = resolved.value.substring(0, 8); // First 8 chars for deduplication
+      if (!warnedPlaintextKeys.has(keyPattern)) {
+        console.warn(
+          `[memu-engine] Plaintext API key detected for ${keyName}. ` +
+          `Consider using SecretRef for better security. ` +
+          `Examples:\n` +
+          `  - Simplified syntax: "\${${envVarName}}"\n` +
+          `  - Full SecretRef: {"source": "env", "provider": "default", "id": "${envVarName}"}`
+        );
+        warnedPlaintextKeys.add(keyPattern);
+      }
+    }
+    return resolved.value;
+  }
+
+  // Fallback to environment variable
+  const envValue = process.env[envVarName];
+  if (envValue) {
+    return envValue;
+  }
+
+  // No value available - return empty string (Python will handle the error)
+  return "";
+}
+
+// ============================================================================
+// Other Types
+// ============================================================================
 type PythonBootstrapResult = {
   ok: boolean;
   reason?: string;
@@ -365,7 +562,7 @@ const memuEnginePlugin = {
       });
     };
 
-    const startSyncService = (pluginConfig: any, workspaceDir: string) => {
+    const startSyncService = async (pluginConfig: any, workspaceDir: string) => {
       if (syncProcess) return; // Already running
 
       const pyReady = ensurePythonRuntime();
@@ -384,18 +581,30 @@ const memuEnginePlugin = {
       const userId = getUserId(pluginConfig);
       const sessionDir = getSessionDir();
       
+      // Resolve API keys with SecretRef support
+      const embedApiKey = await resolveApiKeyWithFallback(
+        embeddingConfig.apiKey,
+        "MEMU_EMBED_API_KEY",
+        "embedding.apiKey"
+      );
+      const chatApiKey = await resolveApiKeyWithFallback(
+        extractionConfig.apiKey,
+        "MEMU_CHAT_API_KEY",
+        "extraction.apiKey"
+      );
+      
       const ingestConfig = pluginConfig.ingest || {};
       const env = {
         ...process.env,
         PYTHONIOENCODING: "utf-8",
         MEMU_USER_ID: userId,
         MEMU_EMBED_PROVIDER: embeddingConfig.provider || "openai",
-        MEMU_EMBED_API_KEY: embeddingConfig.apiKey || process.env.MEMU_EMBED_API_KEY || "",
+        MEMU_EMBED_API_KEY: embedApiKey,
         MEMU_EMBED_BASE_URL: embeddingConfig.baseUrl || "https://api.openai.com/v1",
         MEMU_EMBED_MODEL: embeddingConfig.model || "text-embedding-3-small",
 
         MEMU_CHAT_PROVIDER: extractionConfig.provider || "openai",
-        MEMU_CHAT_API_KEY: extractionConfig.apiKey || process.env.MEMU_CHAT_API_KEY || "",
+        MEMU_CHAT_API_KEY: chatApiKey,
         MEMU_CHAT_BASE_URL: extractionConfig.baseUrl || "https://api.openai.com/v1",
         MEMU_CHAT_MODEL: extractionConfig.model || "gpt-4o-mini",
 
@@ -608,13 +817,25 @@ const memuEnginePlugin = {
       }
 
       // Key point: Trigger background service here (lazy singleton)
-      startSyncService(pluginConfig, workspaceDir);
+      await startSyncService(pluginConfig, workspaceDir);
 
       const embeddingConfig = pluginConfig.embedding || {};
       const extractionConfig = pluginConfig.extraction || {};
       const extraPaths = computeExtraPaths(pluginConfig, workspaceDir);
       const sessionDir = getSessionDir();
       const userId = getUserId(pluginConfig);
+      
+      // Resolve API keys with SecretRef support (no env fallback in runPython)
+      const embedApiKey = await resolveApiKeyWithFallback(
+        embeddingConfig.apiKey,
+        "MEMU_EMBED_API_KEY",
+        "embedding.apiKey"
+      );
+      const chatApiKey = await resolveApiKeyWithFallback(
+        extractionConfig.apiKey,
+        "MEMU_CHAT_API_KEY",
+        "extraction.apiKey"
+      );
       
       const ingestConfig = pluginConfig.ingest || {};
       const env = {
@@ -623,12 +844,12 @@ const memuEnginePlugin = {
         MEMU_USER_ID: userId,
         
         MEMU_EMBED_PROVIDER: embeddingConfig.provider || "openai",
-        MEMU_EMBED_API_KEY: embeddingConfig.apiKey || "",
+        MEMU_EMBED_API_KEY: embedApiKey,
         MEMU_EMBED_BASE_URL: embeddingConfig.baseUrl || "https://api.openai.com/v1",
         MEMU_EMBED_MODEL: embeddingConfig.model || "text-embedding-3-small",
         
         MEMU_CHAT_PROVIDER: extractionConfig.provider || "openai",
-        MEMU_CHAT_API_KEY: extractionConfig.apiKey || "",
+        MEMU_CHAT_API_KEY: chatApiKey,
         MEMU_CHAT_BASE_URL: extractionConfig.baseUrl || "https://api.openai.com/v1",
         MEMU_CHAT_MODEL: extractionConfig.model || "gpt-4o-mini",
 

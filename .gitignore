@@ -20,3 +20,4 @@ package-lock.json
 # Misc
 *.bak
 .DS_Store
+docs/
