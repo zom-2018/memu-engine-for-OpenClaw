@@ -20,4 +20,8 @@ package-lock.json
 # Misc
 *.bak
 .DS_Store
+
+# Local documentation and release notes
 docs/
+RELEASE_*.md
+PUBLISH_*.md
