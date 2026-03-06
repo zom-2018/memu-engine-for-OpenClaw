@@ -1,4 +1,7 @@
+<!-- markdownlint-disable MD013 MD031 MD032 MD033 MD034 MD040 MD004 MD030 MD022 MD007 MD012 MD009 MD025 -->
 # memU Engine for OpenClaw
+
+[![Tests](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/actions/workflows/test.yml/badge.svg)](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/actions/workflows/test.yml)
 
 Project Links:
 
@@ -9,45 +12,39 @@ Language:
 
 - [Chinese (中文)](README_ZH.md)
 
-## Latest Updates
+## Changes in v0.3.1
 
-### v0.2.6 - SecretRef Support & Issue #7 Fix
+v0.3.1 changes `memu-engine` from a single-store memory plugin into a per-agent memory layout with explicit shared storage and retrieval rules.
 
-- ✅ **Full support for OpenClaw's `${VAR}` environment variable syntax** (fixes [Issue #7](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/issues/7))
-- ✅ Support for SecretRef objects with `env` source
-- ✅ Backward compatible with plain text API keys (with security warnings)
-- ✅ Automatic fallback to environment variables (`MEMU_EMBED_API_KEY`, `MEMU_CHAT_API_KEY`)
+| Area | v0.2.6 | v0.3.1 |
+| --- | --- | --- |
+| Agent memory | Single `memu.db` | One DB per agent: `memory/<agent>/memu.db` |
+| Shared docs | Mixed into the same store | Dedicated shared store: `memory/shared/memu.db` |
+| Cross-agent retrieval | Legacy coarse switch | Explicit per-agent `searchableStores` policy |
+| Runtime layout | Legacy scattered paths | Unified `~/.openclaw/memUdata` |
+| Upgrade path | Manual reasoning required | Auto migration with backup-first behavior |
 
-**Recommended API Key Configuration:**
-```jsonc
-{
-  "embedding": {
-    "apiKey": "${OPENAI_API_KEY}"  // Safe to commit to git!
-  }
-}
-```
+### What changed for users
 
-Set environment variable once:
-```bash
-echo 'export OPENAI_API_KEY="sk-your-key"' >> ~/.bashrc
-source ~/.bashrc
-```
+- **Per-agent memory**: each agent writes to its own DB, so memory is isolated by default.
+- **Explicit sharing**: cross-agent retrieval is controlled by `agentSettings.searchableStores`.
+- **Simpler paths**: conversations, resources, memory DBs, and state files live under one root.
+- **Automatic upgrade**: old `v0.2.6` data is migrated to the new layout with backup-first behavior.
 
-### v0.2.1 Update (quick notes)
+Useful docs:
 
-- `memory_search` now supports **compact output** (default) to reduce model token usage.
-- Added retrieval controls in config: `mode` (`fast`/`full`), `contextMessages`, `defaultCategoryQuota`, `defaultItemQuota`, `outputMode`.
-- Sync service is more stable on gateway stop/restart.
-- Added rate-limit backoff for sync retries and reduced empty-run log noise.
+- **[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**: parameter defaults, optional fields, and precedence.
 
-For full parameter docs (defaults, optional fields, precedence), see: **[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**
+## Overview
 
-## Introduction
+`memu-engine` turns OpenClaw session logs and workspace Markdown into structured, retrievable memory.
 
-`memu-engine` is an OpenClaw memory plugin designed to bring MemU's powerful atomic memory capabilities to OpenClaw.
-It listens to OpenClaw's session logs and workspace documents, incrementally extracts key information (profiles, events, knowledge, skills, etc.), and stores them in a local SQLite database for instant retrieval by the agent.
+- It extracts profiles, events, knowledge, skills, and behavior signals from conversations.
+- It stores agent memory locally in SQLite/vector-backed MemU databases.
+- It keeps shared documents separate from agent-private memory.
+- It exposes the result through OpenClaw's memory plugin slot, so agents can call `memory_search` directly.
 
-> Core Advantage: MemU's memory extraction algorithm transforms unstructured conversations into high-quality structured data. See the [MemU official documentation](https://github.com/NevaMind-AI/MemU) for details.
+It is built on top of MemU's extraction pipeline. See the [MemU upstream project](https://github.com/NevaMind-AI/MemU) for the model and method details.
 
 ## Install (Official OpenClaw Flow)
 
@@ -83,9 +80,103 @@ openclaw gateway restart
 
 After restarting, just say "Call `memory_search`" to your agent. The background sync service will automatically start and begin the initial full sync.
 
+## Storage Layout
+
+v0.3.1 stores runtime data under one root:
+
+```text
+~/.openclaw/memUdata/
+├── conversations/          # converted session parts
+├── resources/              # ingested document artifacts
+├── memory/
+│   ├── shared/memu.db      # shared document store
+│   ├── main/memu.db        # main agent memory
+│   └── <agent>/memu.db     # other agent memories
+└── state/                  # sync state and bookkeeping
+```
+
+Compared with `v0.2.6`, the layout is easier to inspect, back up, migrate, and clean because each part now has a fixed directory.
+
+If you are upgrading from v0.2.6, the plugin automatically migrates the legacy single-DB layout into the new per-agent layout and keeps a backup before writing.
+
+## Quick Start Configuration
+
+### Minimal single-agent setup
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "enabled": false
+      }
+    }
+  },
+  "plugins": {
+    "slots": { "memory": "memu-engine" },
+    "entries": {
+      "memu-engine": {
+        "enabled": true,
+        "config": {
+          "embedding": {
+            "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "${OPENAI_API_KEY}",
+            "model": "text-embedding-3-small"
+          },
+          "extraction": {
+            "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "${OPENAI_API_KEY}",
+            "model": "gpt-4o-mini"
+          },
+          "language": "en"
+        }
+      }
+    }
+  }
+}
+```
+
+### Minimal multi-agent setup
+
+```jsonc
+{
+  "plugins": {
+    "slots": { "memory": "memu-engine" },
+    "entries": {
+      "memu-engine": {
+        "enabled": true,
+        "config": {
+          "memoryRoot": "~/.openclaw/memUdata/memory",
+          "agentSettings": {
+            "main": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared", "research"]
+            },
+            "research": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared"]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Reading rule for the example above:
+
+- `main` can search its own memory, the shared doc store, and `research` memory.
+- `research` can search only its own memory plus shared docs.
+- Both agents still write into separate DBs.
+
 ## Configuration Details
 
-Below is a complete configuration example with parameter explanations. It is recommended to configure in this order:
+Below is a full configuration example with parameter explanations. If you only want a working setup, use the quick-start example above first and return here for tuning.
 
 ```jsonc
 {
@@ -111,8 +202,8 @@ Below is a complete configuration example with parameter explanations. It is rec
           },
           // 3. Output Language
           "language": "en",
-          // 4. Data Directory (Optional)
-          "dataDir": "~/.openclaw/memUdata",
+          // 4. Memory Root (Optional hybrid storage)
+          "memoryRoot": "~/.openclaw/memUdata/memory",
           // 5. Ingest Configuration
           "ingest": {
             "includeDefaultPaths": true,
@@ -131,7 +222,23 @@ Below is a complete configuration example with parameter explanations. It is rec
           },
           // 7. Performance Optimization (Immutable Parts)
           "flushIdleSeconds": 1800, // Flush part after 30 mins of inactivity
-          "maxMessagesPerPart": 60  // Flush part after 60 messages
+          "maxMessagesPerPart": 60,  // Flush part after 60 messages
+          // 8. Multi-agent Memory Policy
+          "agentSettings": {
+            "main": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared", "trial"]
+            },
+            "trial": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared"]
+            }
+          },
+          // 9. Document Chunking
+          "chunkSize": 512,      // 1-2048, default 512
+          "chunkOverlap": 50     // >=0, < chunkSize, default 50
         }
       }
     }
@@ -210,17 +317,21 @@ Specifies the language for generated memory summaries.
 *   **Options**: `zh` (Chinese), `en` (English), `ja` (Japanese).
 *   **Suggestion**: Set to the same language as your daily conversations to improve memory recognition rates.
 
-### 4. `dataDir` (Data Directory)
-Specifies where memU database and conversation files are stored.
-*   **Default**: `~/.openclaw/memUdata`
-*   **Usage**: Chat logs are sensitive data; you can store them in an encrypted partition or custom location.
-*   **Structure**:
+### 4. `memoryRoot` (Hybrid storage layout)
+Defines the root directory where the runtime keeps all agent-specific memories alongside a shared document store.
+*   **Default**: `~/.openclaw/memUdata/memory`
+*   **Usage**: Each configured agent gets its own subdirectory containing `memu.db`, while a `shared/` subdirectory hosts the document database and chunks that all agents can reference.
+*   **High-level structure** (names are illustrative, not enforced filenames):
     ```
-    {dataDir}/
-    ├── memu.db           # SQLite database
-    ├── conversations/    # Conversation parts
-    └── resources/        # Resource files
+    {memoryRoot}/
+    ├── shared/            # Shared document store (documents + chunks)
+    │   └── memu.db
+    ├── main/              # Agent-specific memory store
+    │   └── memu.db
+    └── <agentName>/       # Additional agents use the same pattern
+        └── memu.db
     ```
+*   **Migration**: On startup the plugin checks for the legacy single-DB layout (e.g., `~/.openclaw/memUdata/memu.db`). If it exists, `watch_sync.py`/`auto_sync.py` move data into `memoryRoot/<agent>/memu.db` (defaulting to `main`) and keep a backup of the legacy file.
 
 ### 5. `ingest` (Document Ingest)
 Configures which additional Markdown documents to ingest besides session logs.
@@ -242,11 +353,60 @@ Controls how `memory_search` behaves.
 
 > Full details, defaults, and precedence rules: **[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**
 
+### 6.1 Agent settings
+
+`agentSettings` replaces the old `enabledAgents`/`allowCrossAgentRetrieval` knobs and lets you define per-agent policies directly in `openclaw.json`.
+
+*   **`memoryEnabled`** (bool, default `true`): enable writing and updating structured memory for this agent.
+*   **`searchEnabled`** (bool, default `true`): allow the agent to issue `memory_search` calls.
+*   **`searchableStores`** (array of `self`, `shared`, or explicit agent names, default `['self']`): controls which agent stores are searchable when this agent runs `memory_search`. `self` is automatically replaced with the requesting agent name.
+
+If a caller omits `agentName` when invoking `memory_search`, the runtime assumes `main` and still respects the agent's `agentSettings` entry. Search results always include `agentName`, so you can tell which agent produced each memory record, even if retrieval spans multiple stores.
+
+Set `agentSettings` under `plugins.entries["memu-engine"].config` to match your workspace agents and trust boundaries. The runtime also ensures `main` is always enabled, even if it is not declared.
+
+Example: enable `trial` memory, let `main` search `trial` + shared docs, and keep `trial` restricted to self + shared docs:
+
+```jsonc
+"agentSettings": {
+  "main": {
+    "memoryEnabled": true,
+    "searchEnabled": true,
+    "searchableStores": ["self", "shared", "trial"]
+  },
+  "trial": {
+    "memoryEnabled": true,
+    "searchEnabled": true,
+    "searchableStores": ["self", "shared"]
+  }
+}
+```
+
+Behavior for this example:
+- `main`: can search own memory + `trial` memory + `shared` document store.
+- `trial`: can search own memory + `shared` document store only.
+
 ### 7. Performance Optimization (Immutable Parts)
 This plugin uses an "Immutable Parts" strategy to prevent repeated token consumption.
 
 *   **`flushIdleSeconds`** (int): Default `1800` (30 mins). If a session is idle for this long, the staged chat tail (`.tail.tmp`) is "frozen" into a permanent part and written to MemU.
 *   **`maxMessagesPerPart`** (int): Default `60`. If chat accumulates 60 messages, it forces a freeze.
+
+### 8. Document Chunking
+Controls how ingestion divides documents into retrievable parts.
+
+```jsonc
+{
+  "chunkSize": 512,      // 1-2048, default 512
+  "chunkOverlap": 50     // >=0, < chunkSize, default 50
+}
+```
+
+**Parameters**:
+*   `chunkSize`: Maximum characters per chunk (1-2048)
+*   `chunkOverlap`: Overlap between consecutive chunks (must be < chunkSize)
+
+**Recommendation**: The defaults (chunkSize=512, chunkOverlap=50) suit most documents. Increase chunkSize for longer context windows or reduce chunkOverlap when you want more distinct splits.
 
 ---
 
@@ -286,7 +446,7 @@ If your local inference service (vLLM, Ollama, LM Studio, etc.) exposes an OpenA
 ### Session Sanitization
 Before sending to LLM, the plugin deeply cleans raw logs:
 
-1.  **Main Session Locking**: Only locks main sessions via `sessions.json` ID; does not record sub-agent conversations.
+1.  **Agent-Scoped Session Locking**: Tracks sessions per configured agent policy (`agentSettings`) and writes memory with `agentName` scope.
 2.  **De-noising**: Removes `NO_REPLY`, `System:` prompts, Tool Calls, and other non-normal conversation content.
 3.  **Anonymization**: Removes `message_id`, Telegram IDs, and other metadata, keeping only plain text.
 
@@ -298,6 +458,34 @@ All data is stored in local SQLite (`memu.db`).
 </details>
 
 ---
+
+## Troubleshooting
+
+### Official Memory System Conflict
+
+If `agents.defaults.memorySearch.enabled=true` and `plugins.slots.memory="memu-engine"` are both active, OpenClaw official memory and memu-engine run at the same time.
+This dual-memory setup can cause confusing retrieval behavior.
+
+**Recommended fix**: keep memu-engine as the only memory backend and disable official memory search.
+
+Exact `openclaw.json` change:
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "enabled": false
+      }
+    }
+  },
+  "plugins": {
+    "slots": {
+      "memory": "memu-engine"
+    }
+  }
+}
+```
 
 ## Disable and Uninstall
 

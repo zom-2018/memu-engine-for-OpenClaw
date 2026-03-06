@@ -5,10 +5,14 @@ import json
 import tempfile
 import sys
 import signal
-from typing import Optional
+import traceback
+from typing import Optional, Dict, Tuple, Any, TYPE_CHECKING
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+if TYPE_CHECKING:
+    pass
 
 
 # Configuration paths
@@ -67,7 +71,8 @@ def _try_acquire_lock(lock_path: str, stale_seconds: int = 15 * 60):
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
         fd = os.open(lock_path, flags)
-        os.write(fd, str(os.getpid()).encode("utf-8"))
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as f:
+            f.write(str(os.getpid()))
         return fd
     except FileExistsError:
         try:
@@ -107,11 +112,11 @@ def _try_acquire_lock(lock_path: str, stale_seconds: int = 15 * 60):
         return None
 
 
-def _release_lock(lock_path: str, fd):
+def _release_lock(lock_path: str, lock_handle):
     try:
-        if fd is not None:
+        if isinstance(lock_handle, int):
             try:
-                os.close(fd)
+                os.close(lock_handle)
             except OSError:
                 pass
     finally:
@@ -132,29 +137,69 @@ def _docs_full_scan_marker_path() -> Optional[str]:
     data_dir = os.getenv("MEMU_DATA_DIR")
     if not data_dir:
         return None
-    return os.path.join(data_dir, "docs_full_scan.marker")
+    return os.path.join(data_dir, "state", "docs_full_scan.marker")
 
 
-def _get_main_session_file() -> Optional[str]:
-    """Best-effort: resolve main session file path from sessions.json."""
-    if not SESSIONS_DIR:
-        return None
-    sessions_json = os.path.join(SESSIONS_DIR, "sessions.json")
+def _enabled_agents_from_settings() -> list[str]:
+    raw = os.getenv("MEMU_AGENT_SETTINGS", "")
+    if not raw.strip():
+        return ["main"]
     try:
-        with open(sessions_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        main_id = (data.get("agent:main:main") or {}).get("sessionId")
-        if not main_id:
-            return None
-        p = os.path.join(SESSIONS_DIR, f"{main_id}.jsonl")
-        return p if os.path.exists(p) else None
+        loaded = json.loads(raw)
     except Exception:
-        return None
+        return ["main"]
+    if not isinstance(loaded, dict):
+        return ["main"]
+
+    out: list[str] = []
+    for name, cfg in loaded.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        if bool(cfg.get("memoryEnabled", True)):
+            out.append(name)
+
+    if not out:
+        return ["main"]
+    return list(dict.fromkeys(out))
+
+
+def _get_agent_session_files(
+    sessions_dir: str,
+    enabled_agents: list[str],
+) -> dict[str, str]:
+    if not sessions_dir:
+        return {}
+
+    enabled = set(a for a in enabled_agents if isinstance(a, str) and a.strip())
+    if not enabled:
+        enabled = {"main"}
+
+    try:
+        os.environ.setdefault("MEMU_DATA_DIR", tempfile.gettempdir())
+        os.environ.setdefault("OPENCLAW_SESSIONS_DIR", sessions_dir)
+        from convert_sessions import discover_session_files
+
+        discovered = discover_session_files(sessions_dir, list(enabled))
+        if not isinstance(discovered, dict):
+            return {}
+        return {
+            str(agent): str(path)
+            for agent, path in discovered.items()
+            if isinstance(agent, str)
+            and agent in enabled
+            and isinstance(path, str)
+            and path
+        }
+    except Exception:
+        return {}
 
 
 def _should_run_idle_flush(
     *,
     main_session_file: Optional[str],
+    agent_name: str,
     flush_idle_seconds: int,
 ) -> bool:
     """Low-overhead check to avoid needless auto_sync calls.
@@ -187,18 +232,33 @@ def _should_run_idle_flush(
     if session_id.endswith(".jsonl"):
         session_id = session_id[: -len(".jsonl")]
 
-    tail_path = os.path.join(
-        memu_data_dir, "conversations", f"{session_id}.tail.tmp.json"
-    )
-    try:
-        st = os.stat(tail_path)
-    except FileNotFoundError:
-        return False
-    except Exception:
-        return False
+    tail_candidates = [
+        os.path.join(
+            memu_data_dir,
+            "conversations",
+            agent_name,
+            f"{session_id}.tail.tmp.json",
+        ),
+        os.path.join(memu_data_dir, "conversations", f"{session_id}.tail.tmp.json"),
+    ]
+    seen: set[str] = set()
+    found_nonempty = False
+    for tail_path in tail_candidates:
+        if tail_path in seen:
+            continue
+        seen.add(tail_path)
+        try:
+            st = os.stat(tail_path)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
 
-    # If the staged file is empty-ish, skip triggering.
-    if st.st_size < 10:
+        if st.st_size >= 10:
+            found_nonempty = True
+            break
+
+    if not found_nonempty:
         return False
 
     return True
@@ -292,8 +352,8 @@ class SyncHandler(FileSystemEventHandler):
             return
 
         lock_name = _trigger_lock_name(self.script_name)
-        lock_fd = _try_acquire_lock(lock_name)
-        if lock_fd is None:
+        lock_handle = _try_acquire_lock(lock_name)
+        if lock_handle is None:
             return
         try:
             self.last_run = time.time()
@@ -307,124 +367,309 @@ class SyncHandler(FileSystemEventHandler):
         except Exception as e:
             print(f"Failed to trigger {self.script_name}: {e}")
         finally:
-            _release_lock(lock_name, lock_fd)
+            _release_lock(lock_name, lock_handle)
+
+
+def start_watching_agent(
+    agent_name: str,
+    sessions_dir: str,
+    observer: Any,
+    flush_idle_seconds: int,
+    flush_poll_seconds: int,
+) -> Tuple[Optional["SyncHandler"], Dict[str, Any]]:
+    """Setup watching for a single agent's sessions directory.
+    
+    Returns:
+        (session_handler, state_dict) where state_dict contains:
+        - main_session_file_box: mutable box for tracking main session file
+        - last_poll_tick: last poll timestamp
+        - last_idle_trigger_mtime: last idle trigger mtime
+    """
+    if not sessions_dir or not os.path.exists(sessions_dir):
+        print(f"[{agent_name}] Warning: Session dir {sessions_dir} not found or not set.")
+        return None, {}
+
+    print(f"[{agent_name}] Watching sessions: {sessions_dir}")
+
+    sessions_dir_abs = os.path.abspath(sessions_dir)
+    enabled_agents = _enabled_agents_from_settings()
+    session_files_box: Dict[str, dict[str, str]] = {
+        "paths": _get_agent_session_files(sessions_dir, enabled_agents)
+    }
+
+    def _tracked_session_file() -> Optional[str]:
+        return session_files_box["paths"].get(agent_name)
+
+    def _is_sessions_json_path(path: str) -> bool:
+        if not path:
+            return False
+        try:
+            p = os.path.abspath(path)
+            return os.path.dirname(p) == sessions_dir_abs and os.path.basename(
+                p
+            ) == "sessions.json"
+        except Exception:
+            return False
+
+    def _sessions_should_trigger(
+        *, src_path: str, dest_path: str | None = None
+    ) -> bool | tuple[bool, dict[str, str]]:
+        paths = [p for p in (src_path, dest_path) if p]
+        abs_paths = []
+        for p in paths:
+            try:
+                abs_paths.append(os.path.abspath(p))
+            except Exception:
+                continue
+
+        if any(_is_sessions_json_path(p) for p in paths):
+            session_files_box["paths"] = _get_agent_session_files(
+                sessions_dir, _enabled_agents_from_settings()
+            )
+            return True, {
+                "MEMU_AGENT_NAME": agent_name,
+                "OPENCLAW_SESSIONS_DIR": sessions_dir,
+            }
+
+        tracked_session_file = _tracked_session_file()
+        tracked_abs = (
+            os.path.abspath(tracked_session_file) if tracked_session_file else None
+        )
+
+        if tracked_abs and any(p == tracked_abs for p in abs_paths):
+            return True, {
+                "MEMU_AGENT_NAME": agent_name,
+                "OPENCLAW_SESSIONS_DIR": sessions_dir,
+            }
+
+        interested = any(
+            p.startswith(sessions_dir_abs + os.sep)
+            and (p.endswith(".jsonl") or p.endswith(".json"))
+            for p in abs_paths
+        )
+        if interested:
+            prev_tracked = _tracked_session_file()
+            session_files_box["paths"] = _get_agent_session_files(
+                sessions_dir, _enabled_agents_from_settings()
+            )
+            refreshed_tracked = _tracked_session_file()
+
+            if prev_tracked != refreshed_tracked:
+                extra_env: dict[str, str] = {}
+                if prev_tracked:
+                    prev_main_id = os.path.basename(prev_tracked)
+                    if prev_main_id.endswith(".jsonl"):
+                        prev_main_id = prev_main_id[: -len(".jsonl")]
+                    if prev_main_id:
+                        # Ask auto_sync to salvage/finalize the previous main
+                        # session tail so /new reset archives do not strand
+                        # un-ingested messages.
+                        extra_env["MEMU_PREV_MAIN_SESSION_ID"] = prev_main_id
+                extra_env["MEMU_AGENT_NAME"] = agent_name
+                extra_env["OPENCLAW_SESSIONS_DIR"] = sessions_dir
+                return (True, extra_env)
+
+            refreshed_abs = (
+                os.path.abspath(refreshed_tracked) if refreshed_tracked else None
+            )
+            if refreshed_abs and any(p == refreshed_abs for p in abs_paths):
+                return True, {
+                    "MEMU_AGENT_NAME": agent_name,
+                    "OPENCLAW_SESSIONS_DIR": sessions_dir,
+                }
+
+        return False
+
+    session_handler = SyncHandler(
+        "auto_sync.py", [".jsonl", ".json"], should_trigger=_sessions_should_trigger
+    )
+    watch = observer.schedule(session_handler, sessions_dir, recursive=False)
+    # Trigger initial sync
+    session_handler.trigger_sync(
+        changed_path=_tracked_session_file(),
+        extra_env={
+            "MEMU_AGENT_NAME": agent_name,
+            "OPENCLAW_SESSIONS_DIR": sessions_dir,
+        },
+    )
+
+    state = {
+        "session_files_box": session_files_box,
+        "last_poll_tick": 0,
+        "last_idle_trigger_mtime": None,
+        "watch": watch,
+    }
+    return session_handler, state
+
+
+def _reconcile_agent_watchers(
+    *,
+    agent_dirs: dict[str, str],
+    agent_states: dict[str, dict[str, Any]],
+    observer: Any,
+    flush_idle_seconds: int,
+    flush_poll_seconds: int,
+) -> dict[str, dict[str, Any]]:
+    enabled_agents = set(_enabled_agents_from_settings())
+
+    for agent_name in list(agent_states.keys()):
+        if agent_name in enabled_agents:
+            continue
+        state = agent_states.get(agent_name, {}).get("state", {})
+        watch = state.get("watch") if isinstance(state, dict) else None
+        if watch is not None:
+            try:
+                observer.unschedule(watch)
+            except Exception:
+                pass
+        agent_states.pop(agent_name, None)
+
+    for agent_name, sessions_dir in agent_dirs.items():
+        if agent_name not in enabled_agents:
+            continue
+        if agent_name in agent_states:
+            continue
+        handler, state = start_watching_agent(
+            agent_name, sessions_dir, observer, flush_idle_seconds, flush_poll_seconds
+        )
+        if handler:
+            agent_states[agent_name] = {"handler": handler, "state": state}
+
+    return agent_states
+
+
+def process_agent_idle_flushes(
+    *,
+    agent_states: dict[str, dict[str, Any]],
+    agent_dirs: dict[str, str],
+    flush_idle_seconds: int,
+    flush_poll_seconds: int,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {"success": [], "failed": [], "errors": []}
+
+    for agent_name, agent_data in agent_states.items():
+        try:
+            handler = agent_data["handler"]
+            state = agent_data["state"]
+            session_files_box = state["session_files_box"]
+
+            if handler is None or flush_poll_seconds <= 0:
+                results["success"].append(agent_name)
+                continue
+
+            now_i = int(time.time())
+            if now_i % flush_poll_seconds != 0 or now_i == state["last_poll_tick"]:
+                results["success"].append(agent_name)
+                continue
+
+            state["last_poll_tick"] = now_i
+            sessions_dir = agent_dirs.get(agent_name)
+            if sessions_dir:
+                enabled_agents_now = _enabled_agents_from_settings()
+                session_files_box["paths"] = _get_agent_session_files(
+                    sessions_dir, enabled_agents_now
+                )
+
+            main_session_file = session_files_box["paths"].get(agent_name)
+            if main_session_file and _should_run_idle_flush(
+                main_session_file=main_session_file,
+                agent_name=agent_name,
+                flush_idle_seconds=flush_idle_seconds,
+            ):
+                try:
+                    mtime = os.path.getmtime(main_session_file)
+                except Exception:
+                    mtime = None
+                if mtime is not None and mtime != state["last_idle_trigger_mtime"]:
+                    state["last_idle_trigger_mtime"] = mtime
+                    handler.trigger_sync(
+                        extra_env={
+                            "MEMU_AGENT_NAME": agent_name,
+                            "OPENCLAW_SESSIONS_DIR": sessions_dir,
+                        }
+                    )
+
+            results["success"].append(agent_name)
+        except Exception as exc:
+            tb = traceback.format_exc()
+            err = {
+                "agent": agent_name,
+                "error": str(exc),
+                "traceback": tb,
+            }
+            print(
+                f"[watch_sync] idle flush failed for agent '{agent_name}': {exc}\n{tb}",
+                file=sys.stderr,
+            )
+            results["failed"].append({"agent": agent_name, "error": str(exc)})
+            results["errors"].append(err)
+
+    return results
 
 
 if __name__ == "__main__":
-    # Ensure only one watcher instance runs at a time.
     watcher_lock_name = f"{LOCK_FILE}_watch_sync"
-    watcher_lock_fd = _try_acquire_lock(watcher_lock_name)
-    if watcher_lock_fd is None:
+    watcher_lock_handle = _try_acquire_lock(watcher_lock_name)
+    if watcher_lock_handle is None:
         print("Another memU watcher is already running. Exiting.")
         raise SystemExit(0)
+
+    try:
+        from memu.storage_layout import migrate_legacy_single_db_to_agent_db
+
+        migration = migrate_legacy_single_db_to_agent_db(default_agent="main")
+        if migration.migrated:
+            print(
+                f"Legacy DB auto-migrated: {migration.source_db} -> {migration.target_db} "
+                f"(backup={migration.backup_path})"
+            )
+    except Exception as e:
+        print(f"Migration check failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     observer = Observer()
 
     flush_idle_seconds = int(os.getenv("MEMU_FLUSH_IDLE_SECONDS", "1800") or "1800")
     flush_poll_seconds = int(os.getenv("MEMU_FLUSH_POLL_SECONDS", "60") or "60")
-    last_poll_tick = 0
-    last_idle_trigger_mtime: float | None = None
-    # Use a mutable box so nested functions can refresh the path.
-    main_session_file_box: dict[str, Optional[str]] = {"path": _get_main_session_file()}
-    sessions_json_path = (
-        os.path.join(SESSIONS_DIR, "sessions.json") if SESSIONS_DIR else None
-    )
 
-    session_handler: SyncHandler | None = None
+    # Parse agent directories from environment
+    agent_dirs_json = os.getenv("MEMU_AGENT_DIRS")
+    if agent_dirs_json:
+        try:
+            agent_dirs = json.loads(agent_dirs_json)
+            print(f"Monitoring {len(agent_dirs)} agent(s): {', '.join(agent_dirs.keys())}")
+        except json.JSONDecodeError as e:
+            print(f"Error parsing MEMU_AGENT_DIRS: {e}")
+            agent_dirs = {}
+    else:
+        # Backward compatibility: use SESSIONS_DIR for "main" agent
+        if SESSIONS_DIR:
+            agent_dirs = {"main": SESSIONS_DIR}
+            print("Using backward compatibility mode: single agent 'main'")
+        else:
+            agent_dirs = {}
+            print("Warning: No agent directories configured")
+
+    agent_states: dict[str, dict[str, Any]] = {}
+    agent_states = _reconcile_agent_watchers(
+        agent_dirs=agent_dirs,
+        agent_states=agent_states,
+        observer=observer,
+        flush_idle_seconds=flush_idle_seconds,
+        flush_poll_seconds=flush_poll_seconds,
+    )
 
     def _shutdown_handler(signum, frame):
         try:
             observer.stop()
         finally:
-            _release_lock(watcher_lock_name, watcher_lock_fd)
+            _release_lock(watcher_lock_name, watcher_lock_handle)
         raise SystemExit(0)
 
     # Ensure SIGTERM/SIGINT releases the singleton lock.
     signal.signal(signal.SIGTERM, _shutdown_handler)
     signal.signal(signal.SIGINT, _shutdown_handler)
-
-    # 1. Watch Sessions
-    if SESSIONS_DIR and os.path.exists(SESSIONS_DIR):
-        print(f"Watching sessions: {SESSIONS_DIR}")
-
-        sessions_dir_abs = os.path.abspath(SESSIONS_DIR)
-
-        def _is_sessions_json_path(path: str) -> bool:
-            if not path:
-                return False
-            try:
-                p = os.path.abspath(path)
-                return os.path.dirname(p) == sessions_dir_abs and os.path.basename(
-                    p
-                ) == "sessions.json"
-            except Exception:
-                return False
-
-        def _sessions_should_trigger(
-            *, src_path: str, dest_path: str | None = None
-        ) -> bool | tuple[bool, dict[str, str]]:
-            paths = [p for p in (src_path, dest_path) if p]
-            abs_paths = []
-            for p in paths:
-                try:
-                    abs_paths.append(os.path.abspath(p))
-                except Exception:
-                    continue
-
-            # 1) sessions.json may be atomically replaced (rename/move).
-            # Refresh main binding when either side references sessions.json.
-            if any(_is_sessions_json_path(p) for p in paths):
-                main_session_file_box["path"] = _get_main_session_file()
-                return True
-
-            main_session_file = main_session_file_box.get("path")
-            main_abs = os.path.abspath(main_session_file) if main_session_file else None
-
-            # 2) Current tracked main transcript changed.
-            if main_abs and any(p == main_abs for p in abs_paths):
-                return True
-
-            # 3) Any transcript event can indicate a /new switch path changed.
-            # Re-resolve and trigger once when main binding changes.
-            interested = any(
-                p.startswith(sessions_dir_abs + os.sep)
-                and (p.endswith(".jsonl") or p.endswith(".json"))
-                for p in abs_paths
-            )
-            if interested:
-                prev_main = main_session_file_box.get("path")
-                refreshed_main = _get_main_session_file()
-                main_session_file_box["path"] = refreshed_main
-
-                if prev_main != refreshed_main:
-                    extra_env: dict[str, str] = {}
-                    if prev_main:
-                        prev_main_id = os.path.basename(prev_main)
-                        if prev_main_id.endswith(".jsonl"):
-                            prev_main_id = prev_main_id[: -len(".jsonl")]
-                        if prev_main_id:
-                            # Ask auto_sync to salvage/finalize the previous main
-                            # session tail so /new reset archives do not strand
-                            # un-ingested messages.
-                            extra_env["MEMU_PREV_MAIN_SESSION_ID"] = prev_main_id
-                    return (True, extra_env)
-
-                refreshed_abs = (
-                    os.path.abspath(refreshed_main) if refreshed_main else None
-                )
-                if refreshed_abs and any(p == refreshed_abs for p in abs_paths):
-                    return True
-
-            return False
-
-        session_handler = SyncHandler(
-            "auto_sync.py", [".jsonl", ".json"], should_trigger=_sessions_should_trigger
-        )
-        observer.schedule(session_handler, SESSIONS_DIR, recursive=False)
-        # Trigger initial sync
-        session_handler.trigger_sync(changed_path=main_session_file_box.get("path"))
-    else:
-        print(f"Warning: Session dir {SESSIONS_DIR} not found or not set.")
 
     # 2. Watch Docs (Extra Paths)
     extra_paths = get_extra_paths()
@@ -463,34 +708,27 @@ if __name__ == "__main__":
     try:
         while True:
             time.sleep(1)
-            # Periodic idle-flush trigger with minimal overhead:
-            # - does NOT call auto_sync unless the main session file has been idle >= flush_idle_seconds
-            # - re-resolves main session file occasionally in case sessions.json changes
-            if session_handler is not None and flush_poll_seconds > 0:
-                now_i = int(time.time())
-                if now_i % flush_poll_seconds == 0 and now_i != last_poll_tick:
-                    last_poll_tick = now_i
-                    # Re-resolve main session every poll tick so missed FS events
-                    # (e.g., atomic sessions.json replacement via move/rename)
-                    # do not keep us pinned to a stale transcript file.
-                    main_session_file_box["path"] = _get_main_session_file()
-                    # Avoid needless auto_sync calls:
-                    # - only trigger if the session is idle AND a staged tail exists
-                    # - only trigger once per unique session mtime (otherwise we'd spin)
-                    main_session_file = main_session_file_box.get("path")
-                    if main_session_file and _should_run_idle_flush(
-                        main_session_file=main_session_file,
-                        flush_idle_seconds=flush_idle_seconds,
-                    ):
-                        try:
-                            mtime = os.path.getmtime(main_session_file)
-                        except Exception:
-                            mtime = None
-                        if mtime is not None and mtime != last_idle_trigger_mtime:
-                            last_idle_trigger_mtime = mtime
-                            session_handler.trigger_sync()
+            agent_states = _reconcile_agent_watchers(
+                agent_dirs=agent_dirs,
+                agent_states=agent_states,
+                observer=observer,
+                flush_idle_seconds=flush_idle_seconds,
+                flush_poll_seconds=flush_poll_seconds,
+            )
+            flush_results = process_agent_idle_flushes(
+                agent_states=agent_states,
+                agent_dirs=agent_dirs,
+                flush_idle_seconds=flush_idle_seconds,
+                flush_poll_seconds=flush_poll_seconds,
+            )
+            if flush_results["errors"]:
+                print(
+                    f"[watch_sync] idle flush completed with failures: "
+                    f"{len(flush_results['failed'])}/{len(agent_states)} agents",
+                    file=sys.stderr,
+                )
     except KeyboardInterrupt:
         observer.stop()
     finally:
-        _release_lock(watcher_lock_name, watcher_lock_fd)
+        _release_lock(watcher_lock_name, watcher_lock_handle)
     observer.join()

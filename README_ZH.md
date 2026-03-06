@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD013 MD031 MD032 MD033 MD034 MD040 MD004 MD030 MD022 MD007 MD012 MD009 MD025 -->
 # memU Engine for OpenClaw
 
 项目链接：
@@ -9,45 +10,39 @@
 
 - [English](README.md)
 
-## 最新更新
+## v0.3.1 的变化
 
-### v0.2.6 - SecretRef 支持 & Issue #7 修复
+v0.3.1 把 `memu-engine` 从单库记忆插件改成了按代理拆分的记忆布局，同时把共享存储和检索规则明确下来。
 
-- ✅ **完整支持 OpenClaw 的 `${VAR}` 环境变量语法**（修复了 [Issue #7](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/issues/7)）
-- ✅ 支持 SecretRef 对象（`env` source）
-- ✅ 向后兼容明文 API key（会显示安全警告）
-- ✅ 自动回退到环境变量（`MEMU_EMBED_API_KEY`、`MEMU_CHAT_API_KEY`）
+| 维度 | v0.2.6 | v0.3.1 |
+| --- | --- | --- |
+| 代理记忆 | 单个 `memu.db` | 每个代理独立 `memory/<agent>/memu.db` |
+| 共享文档 | 混在同一个库里 | 独立 `memory/shared/memu.db` |
+| 跨代理检索 | 旧的粗粒度开关 | `searchableStores` 精确授权 |
+| 运行时路径 | 历史路径较分散 | 统一到 `~/.openclaw/memUdata` |
+| 升级方式 | 需要自己理解老布局 | 自动迁移，先备份再写入 |
 
-**推荐的 API Key 配置方式：**
-```jsonc
-{
-  "embedding": {
-    "apiKey": "${OPENAI_API_KEY}"  // 可以安全地提交到 git！
-  }
-}
-```
+### 对用户有什么变化
 
-一次性设置环境变量：
-```bash
-echo 'export OPENAI_API_KEY="sk-your-key"' >> ~/.bashrc
-source ~/.bashrc
-```
+- **按代理隔离**：每个代理写自己的数据库，默认不串库。
+- **共享规则明确**：跨代理检索由 `agentSettings.searchableStores` 控制。
+- **路径更简单**：会话、资源、数据库、状态文件都放在同一个根目录下。
+- **升级自动处理**：`v0.2.6` 的旧数据会自动迁移，并在写入前备份。
 
-### v0.2.1 更新（简要）
+相关文档：
 
-- `memory_search` 默认改为 **compact 输出**，减少主模型读取的冗余字段。
-- 新增检索配置：`mode`（`fast`/`full`）、`contextMessages`、`defaultCategoryQuota`、`defaultItemQuota`、`outputMode`。
-- 网关 stop/restart 时同步进程生命周期更稳定。
-- 同步新增限流退避（backoff），并降低空跑日志噪音。
+- **[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**：完整参数、默认值、优先级。
 
-完整参数说明（默认值/可选项/优先级）见：**[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**
+## 这个插件做什么
 
-## 简介
+`memu-engine` 会把 OpenClaw 的会话日志和工作区 Markdown 文档，转成可检索的结构化记忆。
 
-`memu-engine` 是一个 OpenClaw 记忆插件，旨在将 MemU 强大的原子化记忆能力带给 OpenClaw。
-它监听 OpenClaw 的会话日志和工作区文档，增量提取关键信息（画像、事件、知识、技能等），并存储在本地 SQLite 数据库中，供 Agent 随时检索。
+- 从对话里提取画像、事件、知识、技能、行为偏好等信息。
+- 用本地 SQLite/向量检索保存代理记忆。
+- 把共享文档与代理私有记忆分开管理。
+- 通过 OpenClaw 的 memory plugin slot 暴露给 Agent，直接调用 `memory_search` 即可。
 
-> 核心优势：MemU 的记忆提取算法能将非结构化对话转化为高质量的结构化数据。详见 [MemU 官方文档](https://github.com/NevaMind-AI/MemU)。
+底层使用 MemU 的提取链路。上游原理可参考 [MemU 官方项目](https://github.com/NevaMind-AI/MemU)。
 
 ## 安装（官方 OpenClaw 流程）
 
@@ -83,9 +78,103 @@ openclaw gateway restart
 
 重启后，只需对 Agent 说句 "调用 `memory_search`"，后台同步服务就会自动启动并开始首次全量同步。
 
+## 路径结构
+
+v0.3.1 把运行时数据统一放到一个根目录下面：
+
+```text
+~/.openclaw/memUdata/
+├── conversations/          # 转换后的会话分片
+├── resources/              # 文档录入后的资源产物
+├── memory/
+│   ├── shared/memu.db      # 共享文档库
+│   ├── main/memu.db        # main 代理记忆库
+│   └── <agent>/memu.db     # 其他代理的独立记忆库
+└── state/                  # 同步状态与运行时标记
+```
+
+相比 `v0.2.6`，现在更容易按目录理解、备份、迁移和清理记忆，因为每一类数据都有固定位置。
+
+如果你是从 v0.2.6 升级，插件会在启动时自动把旧的单库布局迁移到新的多代理布局，并在写入前保留备份。
+
+## 快速上手配置
+
+### 最小单代理配置
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "enabled": false
+      }
+    }
+  },
+  "plugins": {
+    "slots": { "memory": "memu-engine" },
+    "entries": {
+      "memu-engine": {
+        "enabled": true,
+        "config": {
+          "embedding": {
+            "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "${OPENAI_API_KEY}",
+            "model": "text-embedding-3-small"
+          },
+          "extraction": {
+            "provider": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "${OPENAI_API_KEY}",
+            "model": "gpt-4o-mini"
+          },
+          "language": "zh"
+        }
+      }
+    }
+  }
+}
+```
+
+### 最小多代理配置
+
+```jsonc
+{
+  "plugins": {
+    "slots": { "memory": "memu-engine" },
+    "entries": {
+      "memu-engine": {
+        "enabled": true,
+        "config": {
+          "memoryRoot": "~/.openclaw/memUdata/memory",
+          "agentSettings": {
+            "main": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared", "research"]
+            },
+            "research": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared"]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+上面这个例子的读取规则很简单：
+
+- `main` 可以检索自己的记忆、共享文档库，以及 `research` 的记忆。
+- `research` 只能检索自己的记忆和共享文档库。
+- 两个代理仍然各自写入独立数据库。
+
 ## 配置详解
 
-以下是完整配置示例及参数说明。建议按此结构顺序进行配置：
+以下是完整配置示例及参数说明。如果你只是想先跑起来，建议先用上面的最小配置，再回到这里做细调。
 
 ```jsonc
 {
@@ -111,8 +200,8 @@ openclaw gateway restart
           },
           // 3. 输出语言
           "language": "zh",
-          // 4. 数据存储目录 (可选)
-          "dataDir": "~/.openclaw/memUdata",
+          // 4. 混合存储根目录 (可选)
+          "memoryRoot": "~/.openclaw/memUdata/memory",
           // 5. 文档录入配置
           "ingest": {
             "includeDefaultPaths": true,
@@ -131,7 +220,23 @@ openclaw gateway restart
           },
           // 7. 性能优化参数 (Immutable Parts)
           "flushIdleSeconds": 1800, // 30分钟无对话则固化分片
-          "maxMessagesPerPart": 60  // 满60条则固化分片
+          "maxMessagesPerPart": 60,  // 满60条则固化分片
+          // 8. 多代理内存控制
+          "agentSettings": {
+            "main": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared", "trial"]
+            },
+            "trial": {
+              "memoryEnabled": true,
+              "searchEnabled": true,
+              "searchableStores": ["self", "shared"]
+            }
+          },
+          // 9. 文档分片
+          "chunkSize": 512,      // 1-2048, default 512
+          "chunkOverlap": 50     // >=0, < chunkSize, default 50
         }
       }
     }
@@ -210,17 +315,22 @@ echo $OPENAI_API_KEY
 *   **选项**：`zh` (中文), `en` (英文), `ja` (日文)。
 *   **建议**：设置为与你日常对话相同的语言，有助于提高记忆识别率。
 
-### 4. `dataDir` (数据目录)
-指定 memU 数据库和对话文件的存储位置。
-*   **默认**：`~/.openclaw/memUdata`
-*   **用途**：聊天记录属于敏感数据，你可以将其存储在加密分区或自定义位置。
-*   **目录结构**：
+### 4. `memoryRoot`（混合存储）
+定义插件在磁盘上的混合存储布局，统一管理每个代理的专属记忆与共享文档存储。
+
+*   **默认**：`~/.openclaw/memUdata/memory`
+*   **用途**：每个代理在 `{memoryRoot}/<agentName>/memu.db` 里写入自己的记忆，而 `{memoryRoot}/shared/memu.db` 则保存可被任意代理读取的文档与 chunk。
+*   **高层结构示例**（名称仅示意）：
     ```
-    {dataDir}/
-    ├── memu.db           # SQLite 数据库
-    ├── conversations/    # 对话分片
-    └── resources/        # 资源文件
+    {memoryRoot}/
+    ├── shared/            # 共享文档与 chunk 数据
+    │   └── memu.db
+    ├── main/              # 默认代理记忆库
+    │   └── memu.db
+    └── <agentName>/       # 其他代理遵循相同模式
+        └── memu.db
     ```
+*   **迁移说明**：当遗留的单库布局（例如 `~/.openclaw/memUdata/memu.db`）仍存在时，`watch_sync.py` 或 `auto_sync.py` 会在启动阶段调用迁移逻辑，将数据移动到 `memoryRoot/main/memu.db`（或指定代理），同时保留带时间戳的备份。
 
 ### 5. `ingest` (文档录入)
 配置除会话日志外，还需要录入哪些 Markdown 文档。
@@ -247,6 +357,57 @@ echo $OPENAI_API_KEY
 
 *   **`flushIdleSeconds`** (int): 默认 `1800` (30分钟)。如果一个会话闲置超过此时间，暂存的聊天尾巴 (`.tail.tmp`) 会被“固化”为永久分片并写入 MemU。
 *   **`maxMessagesPerPart`** (int): 默认 `60`。如果聊天积攒满 60 条，也会强制固化。
+
+### 8. `agentSettings`（多代理内存配置）
+
+`agentSettings` 直接写在 `plugins.entries["memu-engine"].config` 中，用于为每个代理定义记忆写入与检索权限。运行时会为每个配置项应用默认策略，并确保 `main` 始终存在，即使配置里省略了它。
+
+*   **`memoryEnabled`**（布尔，默认 `true`）：控制该代理是否写入/更新结构化记忆。设为 `false` 时，该代理的所有记忆 ingestion 都会被跳过。
+*   **`searchEnabled`**（布尔，默认 `true`）：控制该代理是否允许调用 `memory_search`。设为 `false` 后，即使调用发生，运行时也不会执行搜索。
+*   **`searchableStores`**（字符串数组，默认 `['self']`）：指定该代理向哪些存储发起检索。有效值包括 `self`（运行时自动替换为发起请求的代理）、`shared`（共享文档/块数据库）以及明确的其他代理名称。填入其他代理名即可按策略进行跨代理检索。
+
+> 兼容说明：旧参数 `allowCrossAgentRetrieval` 已废弃（deprecated），仍可用但启动时会告警。请迁移到 `agentSettings.<agent>.searchableStores`：
+> - `allowCrossAgentRetrieval=false` → `searchableStores: ["self"]`
+> - `allowCrossAgentRetrieval=true` → `searchableStores: ["self", "shared"]`
+> 当新旧配置同时存在时，以 `agentSettings` 为准。
+
+保留 `self` 让同一份配置可以复用到不同代理；加入 `shared` 让该代理访问共享仓库；写入具体代理名可在授权场景下跨代理拉取记忆。每次 `memory_search` 调用都会带上 `agentName`（默认 `main`），且结果中仍会包含 `agentName`，帮助识别数据来源。
+
+示例：开启 `trial` 的记忆能力，并让 `main` 可检索 `trial` + 共享文档，而 `trial` 仅检索自身 + 共享文档：
+
+```jsonc
+"agentSettings": {
+  "main": {
+    "memoryEnabled": true,
+    "searchEnabled": true,
+    "searchableStores": ["self", "shared", "trial"]
+  },
+  "trial": {
+    "memoryEnabled": true,
+    "searchEnabled": true,
+    "searchableStores": ["self", "shared"]
+  }
+}
+```
+
+- `main`：可检索自身记忆、`trial` 记忆、`shared` 文档库。
+- `trial`：仅可检索自身记忆与 `shared` 文档库。
+
+### 9. 文档分块配置
+控制文档如何被拆分为可检索的 parts。
+
+```jsonc
+{
+  "chunkSize": 512,      // 1-2048, default 512
+  "chunkOverlap": 50     // >=0, < chunkSize, default 50
+}
+```
+
+**参数说明**：
+*   `chunkSize`：每个 chunk 的最大字符数（1-2048）。
+*   `chunkOverlap`：相邻 chunk 之间的重叠字符数，必须小于 chunkSize。
+
+**建议**：默认值（chunkSize=512, chunkOverlap=50）适用于大多数文档。需要更长上下文可适当增大 chunkSize，需要更明显的分割可减少 chunkOverlap。
 
 ---
 
@@ -288,7 +449,7 @@ echo $OPENAI_API_KEY
 ### 会话清洗 (Sanitization)
 在送入 LLM 之前，插件会对原始日志进行深度清洗：
 
-1.  **主会话锁定**：只通过 `sessions.json` 的 ID 锁定主会话，不录取子agents对话。
+1.  **按代理会话处理**：运行时基于代理上下文处理会话并按 `agentName` 写入，支持多代理记忆隔离与检索策略。
 2.  **去噪**：移除 `NO_REPLY`、`System:` 提示、Tool Calls 等非正常对话内容。
 3.  **脱敏**：移除 `message_id`、Telegram ID 等元数据，只保留纯文本内容。
 
@@ -300,6 +461,34 @@ echo $OPENAI_API_KEY
 </details>
 
 ---
+
+## 故障排查
+
+### 官方记忆系统冲突（Official Memory System Conflict）
+
+如果同时启用了 `agents.defaults.memorySearch.enabled=true` 与 `plugins.slots.memory="memu-engine"`，就会出现 OpenClaw 官方记忆与 memu-engine 并行工作的情况。
+两个记忆系统同时生效可能导致检索行为混乱。
+
+**推荐修复方式**：保留 memu-engine 作为唯一记忆后端，并关闭官方 memory search。
+
+`openclaw.json` 精确修改如下：
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "enabled": false
+      }
+    }
+  },
+  "plugins": {
+    "slots": {
+      "memory": "memu-engine"
+    }
+  }
+}
+```
 
 
 ## 禁用与回退

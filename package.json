@@ -1,6 +1,6 @@
 {
   "name": "memu-engine",
-  "version": "0.2.6",
+  "version": "0.3.1",
   "description": "Atomic memory engine for OpenClaw powered by MemU. Features immutable parts for zero redundant token cost.",
   "main": "index.ts",
   "files": [
@@ -15,6 +15,8 @@
     "python/scripts/search.py",
     "python/scripts/get.py",
     "python/scripts/flush.py",
+    "python/scripts/migrate_storage_layout.py",
+    "python/scripts/migrate_agent_id.py",
     "python/src/memu/**/*.py",
     "python/src/memu/**/*.pyi",
     "python/src/memu/**/*.so",
@@ -30,7 +32,9 @@
     ]
   },
   "scripts": {
-    "test": "echo \"No tests yet\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "pack:check": "npm pack --dry-run"
   },
   "repository": {
@@ -55,6 +59,9 @@
   },
   "devDependencies": {
     "@types/node": "^25.2.2",
-    "typescript": "^5.9.3"
+    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/ui": "^4.0.18",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }

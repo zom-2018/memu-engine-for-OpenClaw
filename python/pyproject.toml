@@ -31,3 +31,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memu"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+markers = [
+    "async: marks tests as async",
+    "integration: marks tests as integration tests",
+    "migration: marks tests as migration tests",
+]

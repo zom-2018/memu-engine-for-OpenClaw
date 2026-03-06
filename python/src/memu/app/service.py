@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
@@ -16,6 +17,7 @@ from memu.app.settings import (
     DatabaseConfig,
     LLMConfig,
     LLMProfilesConfig,
+    MemUConfig,
     MemorizeConfig,
     RetrieveConfig,
     UserConfig,
@@ -55,6 +57,7 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         database_config: DatabaseConfig | dict[str, Any] | None = None,
         memorize_config: MemorizeConfig | dict[str, Any] | None = None,
         retrieve_config: RetrieveConfig | dict[str, Any] | None = None,
+        memu_config: MemUConfig | dict[str, Any] | None = None,
         workflow_runner: WorkflowRunner | str | None = None,
         user_config: UserConfig | dict[str, Any] | None = None,
     ):
@@ -66,6 +69,10 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         self.database_config = self._validate_config(database_config, DatabaseConfig)
         self.memorize_config = self._validate_config(memorize_config, MemorizeConfig)
         self.retrieve_config = self._validate_config(retrieve_config, RetrieveConfig)
+        if memu_config is None:
+            self.memu_config = self._default_memu_config_from_env()
+        else:
+            self.memu_config = self._validate_config(memu_config, MemUConfig)
 
         self.fs = LocalFS(self.blob_config.resources_dir)
         self.category_configs: list[CategoryConfig] = list(self.memorize_config.memory_categories or [])
@@ -76,6 +83,7 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
 
         self.database: Database = build_database(
             config=self.database_config,
+            memu_config=self.memu_config,
             user_model=self.user_model,
         )
         # We need the concrete user scope (user_id: xxx) to initialize the categories
@@ -386,6 +394,17 @@ class MemoryService(MemorizeMixin, RetrieveMixin, CRUDMixin):
         if config is None:
             return model_type()
         return model_type.model_validate(config)
+
+    @staticmethod
+    def _default_memu_config_from_env() -> MemUConfig:
+        raw: dict[str, Any] = {}
+        if (v := os.getenv("MEMU_CHUNK_SIZE")) is not None:
+            raw["chunkSize"] = v
+        if (v := os.getenv("MEMU_CHUNK_OVERLAP")) is not None:
+            raw["chunkOverlap"] = v
+        if not raw:
+            return MemUConfig()
+        return MemUConfig.model_validate(raw)
 
     def configure_pipeline(self, *, step_id: str, configs: Mapping[str, Any], pipeline: str = "memorize") -> int:
         revision = self._pipelines.config_step(pipeline, step_id, dict(configs))

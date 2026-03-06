@@ -5,18 +5,15 @@ import sys
 import json
 
 from memu.app.service import MemoryService
-from memu.app.settings import DatabaseConfig, LLMConfig, MetadataStoreConfig
+from memu.app.settings import DatabaseConfig, LLMConfig, MemUConfig, MetadataStoreConfig
+from memu.database.hybrid_factory import HybridDatabaseManager
+from memu.database.lazy_db import fetch_with_locked_retry
+from memu.scope_model import AgentScopeModel
+from memu.storage_layout import agent_db_dsn, migrate_legacy_single_db_to_agent_db
 
 
-def get_db_dsn() -> str:
-    data_dir = os.getenv("MEMU_DATA_DIR")
-    if not data_dir:
-        base = os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        )
-        data_dir = os.path.join(base, "data")
-    os.makedirs(data_dir, exist_ok=True)
-    return f"sqlite:///{os.path.join(data_dir, 'memu.db')}"
+def get_db_dsn(agent_name: str) -> str:
+    return agent_db_dsn(agent_name)
 
 
 def _expand_short_path(short: str) -> str | None:
@@ -34,6 +31,17 @@ def _expand_short_path(short: str) -> str | None:
     except Exception:
         extra_paths = []
 
+    def _iter_conversation_files() -> list[str]:
+        conv_root = os.path.join(data_dir, "conversations") if data_dir else ""
+        if not conv_root or not os.path.isdir(conv_root):
+            return []
+
+        files: list[str] = []
+        for root, _, filenames in os.walk(conv_root):
+            for name in filenames:
+                files.append(os.path.join(root, name))
+        return files
+
     if short.startswith("ws:"):
         rel = short[3:]
         return os.path.join(workspace_dir, rel) if rel else workspace_dir
@@ -47,28 +55,36 @@ def _expand_short_path(short: str) -> str | None:
     m = re.match(r"^conv:([a-f0-9-]+):p(\d+)$", short)
     if m:
         prefix, part = m.group(1), int(m.group(2))
-        conv_dir = os.path.join(data_dir, "conversations") if data_dir else ""
-        if conv_dir and os.path.isdir(conv_dir):
-            for f in os.listdir(conv_dir):
-                if f.startswith(prefix) and f.endswith(f".part{part:03d}.json"):
-                    return os.path.join(conv_dir, f)
+        suffix = f".part{part:03d}.json"
+        for file_path in _iter_conversation_files():
+            basename = os.path.basename(file_path)
+            if basename.startswith(prefix) and basename.endswith(suffix):
+                return file_path
 
     m = re.match(r"^conv:([a-f0-9-]+)$", short)
     if m:
         prefix = m.group(1)
-        conv_dir = os.path.join(data_dir, "conversations") if data_dir else ""
-        if conv_dir and os.path.isdir(conv_dir):
-            for f in os.listdir(conv_dir):
-                if f.startswith(prefix) and f.endswith(".json") and ".part" not in f:
-                    return os.path.join(conv_dir, f)
+        for file_path in _iter_conversation_files():
+            basename = os.path.basename(file_path)
+            if basename.startswith(prefix) and basename.endswith(".json") and ".part" not in basename:
+                return file_path
 
     return None
 
 
 async def get_resource_content(path_or_id: str) -> str:
+    migrate_legacy_single_db_to_agent_db(default_agent="main")
+
     is_memu_uri = path_or_id.startswith("memu://")
     if is_memu_uri:
         path_or_id = path_or_id.replace("memu://", "", 1)
+
+    selected_agent = "main"
+    if path_or_id.startswith("agent/"):
+        parts = path_or_id.split("/", 2)
+        if len(parts) == 3 and parts[1].strip():
+            selected_agent = parts[1].strip()
+            path_or_id = parts[2]
 
     if path_or_id.startswith(("conv:", "ws:", "ext")):
         expanded = _expand_short_path(path_or_id)
@@ -84,12 +100,42 @@ async def get_resource_content(path_or_id: str) -> str:
         chat_model="none",
     )
     db_config = DatabaseConfig(
-        metadata_store=MetadataStoreConfig(provider="sqlite", dsn=get_db_dsn())
+        metadata_store=MetadataStoreConfig(provider="sqlite", dsn=get_db_dsn(selected_agent))
     )
     service = MemoryService(
         llm_profiles={"default": dummy_llm, "embedding": dummy_llm},
         database_config=db_config,
     )
+
+    if path_or_id.startswith("shared/document/"):
+        target = path_or_id.split("/", 2)[2]
+        doc_id = target.split("#", 1)[0]
+        chunk_index = None
+        if "#chunk-" in target:
+            suffix = target.split("#chunk-", 1)[1]
+            if suffix.isdigit():
+                chunk_index = int(suffix)
+
+        manager = HybridDatabaseManager(config=MemUConfig(), db_config=db_config, user_model=AgentScopeModel)
+        try:
+            db = manager.get_shared_db()
+            if chunk_index is None:
+                rows = fetch_with_locked_retry(
+                    db,
+                    "SELECT content FROM document_chunks WHERE document_id = ? ORDER BY chunk_index ASC LIMIT 1",
+                    (doc_id,),
+                )
+            else:
+                rows = fetch_with_locked_retry(
+                    db,
+                    "SELECT content FROM document_chunks WHERE document_id = ? AND chunk_index = ? LIMIT 1",
+                    (doc_id, chunk_index),
+                )
+            row = rows[0] if rows else None
+            if row:
+                return str(row[0] or "")
+        finally:
+            manager.close()
 
     if path_or_id.startswith("category/"):
         category_key = path_or_id.split("/", 1)[1]

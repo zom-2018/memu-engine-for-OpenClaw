@@ -1,14 +1,44 @@
 **/__pycache__/
 **/*.pyc
 
+# tests and local verification artifacts
+tests/
+python/tests/
+.coverage
+coverage/
+baseline_coverage/
+baseline_coverage_ts/
+tests/validation/.generated/
+tests/fixtures/.memu_migration/
+tests/fixtures/v0_2_6_data.backup.*/
+
+# AI/local working artifacts
+.sisyphus/
+.pytest_cache/
+
 python/.venv/
 python/data/
 python/README.md
 python/src/lib.rs
 python/pyproject.toml.bak
 
+# internal/non-release docs
+docs/
 AUDIT_REPORT.md
 RELEASE_*.md
+PUBLISH_*.md
+MANUAL_TESTING.md
+HYBRID_UNIFIED_VALIDATION.md
+RISK_ASSESSMENT_ZH.md
+BASELINE_REPORT.md
+MIGRATION_STRATEGY.md
+MIGRATION_COMPLETE.md
+
+# local config and temporary artifacts
+.openclaw/
+data/
+*.bak
+python/tmp_*
 update_from_upstream.sh
 tsconfig.json
 openclaw.d.ts

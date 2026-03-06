@@ -132,6 +132,8 @@ def build_table_model(
     if unique_with_scope:
         unique_cols = [*unique_with_scope, *scope_fields]
         table_args.append(Index(f"ix_{tablename}__unique_scoped", *unique_cols, unique=True))
+    if tablename == "memory_items" and {"agent_id", "user_id"}.issubset(set(scope_fields)):
+        table_args.append(Index("idx_agent_scope", "agent_id", "user_id"))
 
     base_attrs: dict[str, Any] = {"__module__": core_model.__module__, "__tablename__": tablename}
     if metadata is not None:

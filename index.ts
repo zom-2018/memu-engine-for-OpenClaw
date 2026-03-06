@@ -5,6 +5,147 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 
+interface NormalizedConfig {
+  enabledAgents: string[];
+  agentSettings: Record<
+    string,
+    {
+      memoryEnabled: boolean;
+      searchEnabled: boolean;
+      searchableStores: string[];
+    }
+  >;
+  chunkSize: number;
+  chunkOverlap: number;
+  [key: string]: any;
+}
+
+let warnedAllowCrossAgentRetrievalDeprecation = false;
+
+function normalizeAgentSettings(config: any): Record<string, { memoryEnabled: boolean; searchEnabled: boolean; searchableStores: string[] }> {
+  const raw = config?.agentSettings;
+  const out: Record<string, { memoryEnabled: boolean; searchEnabled: boolean; searchableStores: string[] }> = {};
+  if (raw && typeof raw === "object") {
+    for (const [name, value] of Object.entries(raw)) {
+      if (typeof name !== "string" || !name.trim()) continue;
+      const cfg = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+      const stores = Array.isArray(cfg.searchableStores)
+        ? cfg.searchableStores.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+        : ["self"];
+      out[name] = {
+        memoryEnabled: cfg.memoryEnabled !== false,
+        searchEnabled: cfg.searchEnabled !== false,
+        searchableStores: stores.length > 0 ? stores : ["self"],
+      };
+    }
+  }
+  return out;
+}
+
+function normalizeConfig(config: any): NormalizedConfig {
+  const validAgentPattern = /^[a-z][a-z0-9_-]*$/;
+  const oldEnabledAgents = Array.isArray(config.enabledAgents)
+    ? config.enabledAgents.filter((a: unknown): a is string => typeof a === "string" && a.trim().length > 0)
+    : [];
+  const agentSettings = normalizeAgentSettings(config);
+  const enabledAgents = Array.from(new Set(["main", ...Object.keys(agentSettings), ...oldEnabledAgents]));
+
+  if (!enabledAgents.includes("main")) {
+    enabledAgents.unshift("main");
+  }
+  const invalidAgents = enabledAgents.filter((a: string) => !validAgentPattern.test(a));
+  if (invalidAgents.length > 0) {
+    console.warn(`[memu-engine] Invalid agent names: ${invalidAgents.join(", ")}`);
+  }
+
+  const rawStorageMode = typeof config.storageMode === "string" ? config.storageMode.trim().toLowerCase() : "hybrid";
+  if (rawStorageMode && rawStorageMode !== "hybrid") {
+    console.warn(
+      `[memu-engine] storageMode='${rawStorageMode}' is deprecated and ignored. ` +
+        "memu-engine now always runs in hybrid mode."
+    );
+  }
+
+  const hasLegacyAllowCrossAgentRetrieval = typeof config.allowCrossAgentRetrieval === "boolean";
+  if (hasLegacyAllowCrossAgentRetrieval && !warnedAllowCrossAgentRetrievalDeprecation) {
+    const legacyValue = config.allowCrossAgentRetrieval === true;
+    console.warn(
+      `[memu-engine] 'allowCrossAgentRetrieval' is deprecated and will be removed in a future release. ` +
+        `Migration guide: set per-agent 'agentSettings.<agent>.searchableStores' instead. ` +
+        `Equivalent mapping: allowCrossAgentRetrieval=${legacyValue} -> searchableStores=${
+          legacyValue ? "['self','shared']" : "['self']"
+        }. ` +
+        `When both old and new config are present, agentSettings takes precedence.`
+    );
+    warnedAllowCrossAgentRetrievalDeprecation = true;
+  }
+
+  const normalizedAgentSettings: Record<
+    string,
+    {
+      memoryEnabled: boolean;
+      searchEnabled: boolean;
+      searchableStores: string[];
+    }
+  > = { ...agentSettings };
+
+  if (hasLegacyAllowCrossAgentRetrieval) {
+    const legacyStores = config.allowCrossAgentRetrieval === true ? ["self", "shared"] : ["self"];
+    for (const agentName of enabledAgents) {
+      if (!normalizedAgentSettings[agentName]) {
+        normalizedAgentSettings[agentName] = {
+          memoryEnabled: true,
+          searchEnabled: true,
+          searchableStores: legacyStores,
+        };
+      }
+    }
+  }
+
+  const officialMemorySearchEnabled = config?.agents?.defaults?.memorySearch?.enabled === true;
+  const memuMemorySlotActive = config?.plugins?.slots?.memory === "memu-engine";
+  if (officialMemorySearchEnabled && memuMemorySlotActive) {
+    console.warn(
+      `[memu-engine] Official Memory System Conflict detected: both OpenClaw official memory (` +
+        `agents.defaults.memorySearch.enabled=true) and memu-engine memory slot (` +
+        `plugins.slots.memory="memu-engine") are active at the same time. ` +
+        `This enables two memory systems simultaneously and can produce confusing retrieval behavior. ` +
+        `Recommended fix: disable the official memory system and keep memu-engine as the only memory backend. ` +
+        `Exact change in openclaw.json: set "agents.defaults.memorySearch.enabled": false.`
+    );
+  }
+
+  const rawChunkSize = config.chunkSize ?? 512;
+  const chunkSizeNum = Number(rawChunkSize);
+  if (!Number.isFinite(chunkSizeNum) || !Number.isInteger(chunkSizeNum) || chunkSizeNum <= 0 || chunkSizeNum > 2048) {
+    throw new Error(
+      `[memu-engine] Invalid chunkSize '${String(rawChunkSize)}'. Expected integer in range 1..2048.`
+    );
+  }
+
+  const rawChunkOverlap = config.chunkOverlap ?? 50;
+  const chunkOverlapNum = Number(rawChunkOverlap);
+  if (!Number.isFinite(chunkOverlapNum) || !Number.isInteger(chunkOverlapNum) || chunkOverlapNum < 0) {
+    throw new Error(
+      `[memu-engine] Invalid chunkOverlap '${String(rawChunkOverlap)}'. Expected integer >= 0.`
+    );
+  }
+  if (chunkOverlapNum >= chunkSizeNum) {
+    throw new Error(
+      `[memu-engine] Invalid chunkOverlap '${chunkOverlapNum}'. chunkOverlap must be less than chunkSize (${chunkSizeNum}).`
+    );
+  }
+
+  return {
+    ...config,
+    enabledAgents,
+    agentSettings: normalizedAgentSettings,
+    storageMode: "hybrid",
+    chunkSize: chunkSizeNum,
+    chunkOverlap: chunkOverlapNum,
+  };
+}
+
 // ============================================================================
 // SecretRef Types (aligned with OpenClaw SDK)
 // ============================================================================
@@ -335,18 +476,48 @@ const memuEnginePlugin = {
       return "default";
     };
 
-    const getSessionDir = (): string => {
-      const fromEnv = process.env.OPENCLAW_SESSIONS_DIR;
-      if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+    const getSessionDirs = (enabledAgents: string[]): Map<string, string> => {
+      const agentDirs = new Map<string, string>();
+      const baseDir = path.join(os.homedir(), ".openclaw", "agents");
 
-      const home = process.env.HOME || "";
+      for (const agentName of enabledAgents) {
+        const sessionDir = path.join(baseDir, agentName, "sessions");
+
+        if (fs.existsSync(sessionDir)) {
+          agentDirs.set(agentName, sessionDir);
+        } else {
+          console.warn(
+            `[memu-engine] Agent '${agentName}' sessions directory does not exist: ${sessionDir}`
+          );
+        }
+      }
+
+      if (process.env.OPENCLAW_SESSIONS_DIR) {
+        agentDirs.set("main", process.env.OPENCLAW_SESSIONS_DIR);
+      }
+
+      return agentDirs;
+    };
+
+    const getSessionDir = (): string => {
+      const dirs = getSessionDirs(["main"]);
+      const mainDir = dirs.get("main");
+      if (mainDir && fs.existsSync(mainDir)) {
+        return mainDir;
+      }
+
+      const home = os.homedir();
       const candidates = [
         path.join(home, ".openclaw", "agents", "main", "sessions"),
         path.join(home, ".openclaw", "sessions"),
       ];
-      for (const c of candidates) {
-        if (c && fs.existsSync(c)) return c;
+
+      for (const candidate of candidates) {
+        if (candidate && fs.existsSync(candidate)) {
+          return candidate;
+        }
       }
+
       return candidates[0];
     };
 
@@ -464,8 +635,29 @@ const memuEnginePlugin = {
       return path.join(home, ".openclaw", "memUdata");
     };
 
+    const getMemoryRoot = (pluginConfig: any): string => {
+      const fromConfig = pluginConfig?.memoryRoot;
+      if (typeof fromConfig === "string" && fromConfig.trim()) {
+        return fromConfig.startsWith("~")
+          ? path.join(process.env.HOME || "", fromConfig.slice(1))
+          : fromConfig;
+      }
+      const fromEnv = process.env.MEMU_MEMORY_ROOT;
+      if (typeof fromEnv === "string" && fromEnv.trim()) return fromEnv;
+      return path.join(process.env.HOME || "", ".openclaw", "memUdata", "memory");
+    };
+
+    const serializeAgentDirs = (enabledAgents: string[]): string => {
+      const dirs = getSessionDirs(enabledAgents);
+      const payload: Record<string, string> = {};
+      for (const [name, dir] of dirs.entries()) {
+        payload[name] = dir;
+      }
+      return JSON.stringify(payload);
+    };
+
     const pidFilePath = (dataDir: string) =>
-      path.join(dataDir, "watch_sync.pid");
+      path.join(dataDir, "state", "watch_sync.pid");
 
     let stopInProgressUntil = 0;
 
@@ -565,6 +757,8 @@ const memuEnginePlugin = {
     const startSyncService = async (pluginConfig: any, workspaceDir: string) => {
       if (syncProcess) return; // Already running
 
+      const normalizedConfig = normalizeConfig(pluginConfig || {});
+
       const pyReady = ensurePythonRuntime();
       if (!pyReady.ok) {
         console.error(`[memU] Python bootstrap failed: ${pyReady.reason}`);
@@ -575,10 +769,10 @@ const memuEnginePlugin = {
       lastDataDirForCleanup = dataDir;
       installShutdownHooksOnce();
 
-      const embeddingConfig = pluginConfig.embedding || {};
-      const extractionConfig = pluginConfig.extraction || {};
-      const extraPaths = computeExtraPaths(pluginConfig, workspaceDir);
-      const userId = getUserId(pluginConfig);
+      const embeddingConfig = normalizedConfig.embedding || {};
+      const extractionConfig = normalizedConfig.extraction || {};
+      const extraPaths = computeExtraPaths(normalizedConfig, workspaceDir);
+      const userId = getUserId(normalizedConfig);
       const sessionDir = getSessionDir();
       
       // Resolve API keys with SecretRef support
@@ -593,7 +787,7 @@ const memuEnginePlugin = {
         "extraction.apiKey"
       );
       
-      const ingestConfig = pluginConfig.ingest || {};
+      const ingestConfig = normalizedConfig.ingest || {};
       const env = {
         ...process.env,
         PYTHONIOENCODING: "utf-8",
@@ -609,9 +803,14 @@ const memuEnginePlugin = {
         MEMU_CHAT_MODEL: extractionConfig.model || "gpt-4o-mini",
 
         MEMU_DATA_DIR: dataDir,
+        MEMU_MEMORY_ROOT: getMemoryRoot(normalizedConfig),
+        MEMU_AGENT_DIRS: serializeAgentDirs(normalizedConfig.enabledAgents || ["main"]),
+        MEMU_AGENT_SETTINGS: JSON.stringify(normalizedConfig.agentSettings || {}),
         MEMU_WORKSPACE_DIR: workspaceDir,
         MEMU_EXTRA_PATHS: JSON.stringify(extraPaths),
-        MEMU_OUTPUT_LANG: pluginConfig.language || "auto",
+        MEMU_OUTPUT_LANG: normalizedConfig.language || "auto",
+        MEMU_CHUNK_SIZE: String(normalizedConfig.chunkSize),
+        MEMU_CHUNK_OVERLAP: String(normalizedConfig.chunkOverlap),
         OPENCLAW_SESSIONS_DIR: sessionDir,
         MEMU_FILTER_SCHEDULED_SYSTEM_MESSAGES:
           ingestConfig.filterScheduledSystemMessages === false ? "false" : "true",
@@ -816,14 +1015,16 @@ const memuEnginePlugin = {
         return `Error: memU Python bootstrap failed. ${pyReady.reason || "unknown reason"}`;
       }
 
-      // Key point: Trigger background service here (lazy singleton)
-      await startSyncService(pluginConfig, workspaceDir);
+      const normalizedConfig = normalizeConfig(pluginConfig || {});
 
-      const embeddingConfig = pluginConfig.embedding || {};
-      const extractionConfig = pluginConfig.extraction || {};
-      const extraPaths = computeExtraPaths(pluginConfig, workspaceDir);
+      // Key point: Trigger background service here (lazy singleton)
+      await startSyncService(normalizedConfig, workspaceDir);
+
+      const embeddingConfig = normalizedConfig.embedding || {};
+      const extractionConfig = normalizedConfig.extraction || {};
+      const extraPaths = computeExtraPaths(normalizedConfig, workspaceDir);
       const sessionDir = getSessionDir();
-      const userId = getUserId(pluginConfig);
+      const userId = getUserId(normalizedConfig);
       
       // Resolve API keys with SecretRef support (no env fallback in runPython)
       const embedApiKey = await resolveApiKeyWithFallback(
@@ -837,7 +1038,7 @@ const memuEnginePlugin = {
         "extraction.apiKey"
       );
       
-      const ingestConfig = pluginConfig.ingest || {};
+      const ingestConfig = normalizedConfig.ingest || {};
       const env = {
         ...process.env,
         PYTHONIOENCODING: "utf-8",
@@ -853,12 +1054,17 @@ const memuEnginePlugin = {
         MEMU_CHAT_BASE_URL: extractionConfig.baseUrl || "https://api.openai.com/v1",
         MEMU_CHAT_MODEL: extractionConfig.model || "gpt-4o-mini",
 
-        MEMU_DATA_DIR: getMemuDataDir(pluginConfig),
+        MEMU_DATA_DIR: getMemuDataDir(normalizedConfig),
+        MEMU_MEMORY_ROOT: getMemoryRoot(normalizedConfig),
+        MEMU_AGENT_DIRS: serializeAgentDirs(normalizedConfig.enabledAgents || ["main"]),
+        MEMU_AGENT_SETTINGS: JSON.stringify(normalizedConfig.agentSettings || {}),
         MEMU_WORKSPACE_DIR: workspaceDir,
         MEMU_EXTRA_PATHS: JSON.stringify(extraPaths),
         OPENCLAW_SESSIONS_DIR: sessionDir,
-        MEMU_OUTPUT_LANG: pluginConfig.language || "auto",
-        MEMU_DEBUG_TIMING: (pluginConfig as any)?.debugTiming === true ? "true" : "false",
+        MEMU_OUTPUT_LANG: normalizedConfig.language || "auto",
+        MEMU_DEBUG_TIMING: (normalizedConfig as any)?.debugTiming === true ? "true" : "false",
+        MEMU_CHUNK_SIZE: String(normalizedConfig.chunkSize),
+        MEMU_CHUNK_OVERLAP: String(normalizedConfig.chunkOverlap),
         MEMU_FILTER_SCHEDULED_SYSTEM_MESSAGES:
           ingestConfig.filterScheduledSystemMessages === false ? "false" : "true",
         MEMU_SCHEDULED_SYSTEM_MODE:
@@ -900,6 +1106,7 @@ const memuEnginePlugin = {
         minScore: { type: "number", description: "Minimum relevance score (0.0 to 1.0)." },
         categoryQuota: { type: "integer", description: "Preferred number of category results." },
         itemQuota: { type: "integer", description: "Preferred number of item results." },
+        agentName: { type: "string", description: "Agent name (default: main)" },
       },
       required: ["query"],
     };
@@ -930,12 +1137,13 @@ const memuEnginePlugin = {
           description,
           parameters: searchSchema,
           async execute(_toolCallId: string, params: unknown) {
-            const { query, maxResults, minScore, categoryQuota, itemQuota } = params as {
+            const { query, maxResults, minScore, categoryQuota, itemQuota, agentName } = params as {
               query?: string;
               maxResults?: number;
               minScore?: number;
               categoryQuota?: number;
               itemQuota?: number;
+              agentName?: string;
             };
             if (!query) {
               return {
@@ -963,6 +1171,34 @@ const memuEnginePlugin = {
             } else if (retrievalCfg.defaultItemQuota !== null) {
               args.push("--item-quota", String(retrievalCfg.defaultItemQuota));
             }
+            const config = normalizeConfig(pluginConfig);
+            const requestingAgent = typeof agentName === "string" && agentName.trim() ? agentName.trim() : "main";
+            const defaultPolicy = { memoryEnabled: true, searchEnabled: true, searchableStores: ["self"] as string[] };
+            const agentPolicy = config.agentSettings?.[requestingAgent] || defaultPolicy;
+
+            if (!agentPolicy.searchEnabled) {
+              const payload = JSON.stringify({
+                results: [],
+                provider: "openai",
+                model: "unknown",
+                fallback: null,
+                citations: "off",
+              });
+              return {
+                content: [{ type: "text", text: payload }],
+                details: { error: "search_disabled", requestingAgent },
+              };
+            }
+
+            const resolvedStores = Array.from(
+              new Set(
+                (Array.isArray(agentPolicy.searchableStores) ? agentPolicy.searchableStores : ["self"]).map((store) =>
+                  store === "self" ? requestingAgent : store
+                )
+              )
+            );
+            args.push("--requesting-agent", requestingAgent);
+            args.push("--search-stores", resolvedStores.join(","));
             if (retrievalCfg.mode === "full") {
               const sessionDir = getSessionDir();
               const history = getRecentSessionMessages(sessionDir, retrievalCfg.contextMessages);
@@ -984,6 +1220,7 @@ const memuEnginePlugin = {
                   ? parsed.results.map((r: any) => ({
                       path: r?.path,
                       snippet: r?.snippet,
+                      agentName: r?.agentName,
                     }))
                   : [];
                 payload = JSON.stringify({ results: compactResults });

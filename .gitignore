@@ -1,10 +1,16 @@
 # Runtime data / local state
 data/
 python/data/
+.openclaw/
 
 # Python caches
 **/__pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+coverage/
+baseline_coverage/
+baseline_coverage_ts/
 
 # Python env + build artifacts
 python/.venv/
@@ -21,7 +27,31 @@ package-lock.json
 *.bak
 .DS_Store
 
-# Local documentation and release notes
+# AI / local workspace artifacts
+.sisyphus/
+
+# Local docs and working notes (non-release)
 docs/
 RELEASE_*.md
 PUBLISH_*.md
+MANUAL_TESTING.md
+HYBRID_UNIFIED_VALIDATION.md
+RISK_ASSESSMENT_ZH.md
+BASELINE_REPORT.md
+MIGRATION_STRATEGY.md
+MIGRATION_COMPLETE.md
+
+# Local generated validation fixtures
+tests/validation/.generated/
+tests/fixtures/.memu_migration/
+tests/fixtures/v0_2_6_data.backup.*/
+
+# Keep internal generated fixtures tracked
+!tests/validation/.generated/
+!tests/validation/.generated/*.cjs
+
+# Local migration validation test (not for upstream upload)
+python/tests/unit/test_storage_layout_migrate_script.py
+
+# Temporary local inputs / benchmarks
+python/tmp_*

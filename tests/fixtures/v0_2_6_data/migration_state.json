@@ -1,0 +1,38 @@
+{
+  "source": "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data",
+  "created_at": "2026-03-05T21:40:53",
+  "updated_at": "2026-03-05T21:40:53",
+  "status": "completed",
+  "dry_run": false,
+  "stage": "validation_complete",
+  "checksum_manifest": {
+    "memu.db": "4f524bdb9d88dd678bafce5405b0e82ea74f49cd7d8b6d58d2b6714c19ee4dca",
+    "data/last_sync_ts": "02ffa065f6eac66b34e590eb126a1e2897ec726e64a6b4eaa1b83034075161ac",
+    "data/pending_ingest.json": "3d2fd45af18c094b8792e48fa90e069a199b039dd56a607d7515ea48884fcf3c",
+    "data/config.json": "46683d2a221058e861edd157f586dd4c812e9bafa1984e25aab0bacf7aab9095",
+    "data/conversations/session_main.json": "bc3c2e2a46d35e656f0bd8d20d7e708bb7bafd1c12d9c7ba6e64383ef88d2549",
+    "data/conversations/session_secondary.json": "ac4d4a0841d437491eb70b02c71f40934aad138383260a5c91e78e6cf2101a00"
+  },
+  "report": {
+    "source": "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data",
+    "detected_v0_2_6": true,
+    "migration_targets": [
+      "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data/memu.db",
+      "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data/data/last_sync_ts",
+      "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data/data/pending_ingest.json",
+      "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data/data/config.json",
+      "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data/data/conversations/session_main.json",
+      "/home/xiaoxiong/.openclaw/extensions/memu-engine/tests/fixtures/v0_2_6_data/data/conversations/session_secondary.json"
+    ],
+    "checksums": {
+      "memu.db": "4f524bdb9d88dd678bafce5405b0e82ea74f49cd7d8b6d58d2b6714c19ee4dca",
+      "data/last_sync_ts": "02ffa065f6eac66b34e590eb126a1e2897ec726e64a6b4eaa1b83034075161ac",
+      "data/pending_ingest.json": "3d2fd45af18c094b8792e48fa90e069a199b039dd56a607d7515ea48884fcf3c",
+      "data/config.json": "46683d2a221058e861edd157f586dd4c812e9bafa1984e25aab0bacf7aab9095",
+      "data/conversations/session_main.json": "bc3c2e2a46d35e656f0bd8d20d7e708bb7bafd1c12d9c7ba6e64383ef88d2549",
+      "data/conversations/session_secondary.json": "ac4d4a0841d437491eb70b02c71f40934aad138383260a5c91e78e6cf2101a00"
+    },
+    "estimated_time_seconds": 6,
+    "issues": []
+  }
+}

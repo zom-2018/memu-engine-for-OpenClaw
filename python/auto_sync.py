@@ -21,9 +21,9 @@ def _db_has_column(conn: sqlite3.Connection, *, table: str, column: str) -> bool
         return False
 
 
-def resource_exists(resource_url: str, user_id: str) -> bool:
+def resource_exists(resource_url: str, user_id: str, agent_name: str) -> bool:
     try:
-        dsn = get_db_dsn()
+        dsn = agent_db_dsn(agent_name)
         # dsn is sqlite:///path/to/db
         db_path = dsn.replace("sqlite:///", "")
         if not os.path.exists(db_path):
@@ -66,9 +66,9 @@ def _log(msg: str) -> None:
     line = f"[{timestamp}] {msg}"
     print(line, flush=True)
 
-    log_dir = os.getenv("MEMU_DATA_DIR", os.path.dirname(__file__))
-    log_file = os.path.join(log_dir, "sync.log")
+    log_file = os.path.join(_state_root_dir(), "sync.log")
     try:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -82,6 +82,14 @@ from memu.app.settings import (
     MemorizeConfig,
     MetadataStoreConfig,
     PromptBlock,
+    UserConfig,
+)
+from memu.scope_model import AgentScopeModel
+from memu.storage_layout import (
+    agent_db_dsn,
+    migrate_legacy_single_db_to_agent_db,
+    parse_agent_settings_from_env,
+    resolve_agent_policy,
 )
 
 from convert_sessions import convert
@@ -167,25 +175,65 @@ def _get_data_dir() -> str:
     return data_dir
 
 
-def _get_sync_marker_path() -> str:
-    return os.path.join(_get_data_dir(), "last_sync_ts")
+def _current_agent_name() -> str:
+    return (os.getenv("MEMU_AGENT_NAME") or "main").strip() or "main"
 
 
-def _get_pending_ingest_path() -> str:
-    return os.path.join(_get_data_dir(), "pending_ingest.json")
+def _state_root_dir() -> str:
+    return os.path.join(_get_data_dir(), "state")
 
 
-def _get_pending_backoff_path() -> str:
-    return os.path.join(_get_data_dir(), "pending_backoff.json")
+def _sync_state_dir(agent_name: str | None = None) -> str:
+    resolved_agent = (agent_name or _current_agent_name()).strip() or "main"
+    return os.path.join(_state_root_dir(), "sync", resolved_agent)
 
 
-def _get_empty_sync_log_marker_path() -> str:
-    return os.path.join(_get_data_dir(), "empty_sync_log.marker")
+def _get_sync_marker_path(agent_name: str | None = None) -> str:
+    return os.path.join(_sync_state_dir(agent_name), "last_sync_ts")
 
 
-def _load_pending_ingest() -> list[str]:
+def _get_pending_ingest_path(agent_name: str | None = None) -> str:
+    return os.path.join(_sync_state_dir(agent_name), "pending_ingest.json")
+
+
+def _get_pending_backoff_path(agent_name: str | None = None) -> str:
+    return os.path.join(_sync_state_dir(agent_name), "pending_backoff.json")
+
+
+def _get_empty_sync_log_marker_path(agent_name: str | None = None) -> str:
+    return os.path.join(_sync_state_dir(agent_name), "empty_sync_log.marker")
+
+
+def _infer_agent_from_session_path(session_path: str) -> str:
+    def _extract_agent(path_value: str | None) -> str | None:
+        if not path_value:
+            return None
+        normalized = os.path.normpath(os.path.expanduser(path_value))
+        parts = [part for part in normalized.split(os.sep) if part]
+        for idx, part in enumerate(parts):
+            if part != "agents":
+                continue
+            if idx + 2 >= len(parts):
+                continue
+            if parts[idx + 2] != "sessions":
+                continue
+            agent = parts[idx + 1].strip()
+            if agent:
+                return agent
+        return None
+
+    if agent := _extract_agent(session_path):
+        return agent
+
+    if agent := _extract_agent(os.getenv("OPENCLAW_SESSIONS_DIR")):
+        return agent
+
+    return "main"
+
+
+def _load_pending_ingest(agent_name: str | None = None) -> list[str]:
     try:
-        with open(_get_pending_ingest_path(), "r", encoding="utf-8") as f:
+        with open(_get_pending_ingest_path(agent_name), "r", encoding="utf-8") as f:
             payload = json.load(f)
         paths = payload.get("paths") if isinstance(payload, dict) else None
         if isinstance(paths, list):
@@ -195,8 +243,8 @@ def _load_pending_ingest() -> list[str]:
     return []
 
 
-def _save_pending_ingest(paths: list[str]) -> None:
-    marker = _get_pending_ingest_path()
+def _save_pending_ingest(paths: list[str], agent_name: str | None = None) -> None:
+    marker = _get_pending_ingest_path(agent_name)
     os.makedirs(os.path.dirname(marker), exist_ok=True)
     tmp = marker + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -204,9 +252,9 @@ def _save_pending_ingest(paths: list[str]) -> None:
     os.replace(tmp, marker)
 
 
-def _load_backoff_state() -> dict:
+def _load_backoff_state(agent_name: str | None = None) -> dict:
     try:
-        with open(_get_pending_backoff_path(), "r", encoding="utf-8") as f:
+        with open(_get_pending_backoff_path(agent_name), "r", encoding="utf-8") as f:
             payload = json.load(f)
         if isinstance(payload, dict):
             return payload
@@ -215,8 +263,8 @@ def _load_backoff_state() -> dict:
     return {"next_retry_ts": 0.0, "consecutive_rate_limits": 0, "reason": ""}
 
 
-def _save_backoff_state(state: dict) -> None:
-    marker = _get_pending_backoff_path()
+def _save_backoff_state(state: dict, agent_name: str | None = None) -> None:
+    marker = _get_pending_backoff_path(agent_name)
     os.makedirs(os.path.dirname(marker), exist_ok=True)
     tmp = marker + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -224,12 +272,12 @@ def _save_backoff_state(state: dict) -> None:
     os.replace(tmp, marker)
 
 
-def _should_log_empty_sync() -> bool:
+def _should_log_empty_sync(agent_name: str | None = None) -> bool:
     interval = int(_env("MEMU_EMPTY_SYNC_LOG_INTERVAL_SECONDS", "300") or "300")
     if interval <= 0:
         return True
 
-    marker = _get_empty_sync_log_marker_path()
+    marker = _get_empty_sync_log_marker_path(agent_name)
     now_ts = time.time()
     try:
         with open(marker, "r", encoding="utf-8") as f:
@@ -342,7 +390,7 @@ def _build_language_aware_memorize_config(lang: str | None) -> MemorizeConfig:
     )
 
 
-def build_service() -> MemoryService:
+def build_service(agent_name: str) -> MemoryService:
     chat_kwargs = {}
     if p := _env("MEMU_CHAT_PROVIDER"):
         chat_kwargs["provider"] = p
@@ -366,35 +414,44 @@ def build_service() -> MemoryService:
     embed_config = LLMConfig(**embed_kwargs)
 
     db_config = DatabaseConfig(
-        metadata_store=MetadataStoreConfig(provider="sqlite", dsn=get_db_dsn())
+        metadata_store=MetadataStoreConfig(provider="sqlite", dsn=agent_db_dsn(agent_name))
     )
 
     output_lang = _env("MEMU_OUTPUT_LANG", "")
     memorize_config = _build_language_aware_memorize_config(output_lang)
 
+    user_config = UserConfig(model=AgentScopeModel)
+
     return MemoryService(
         llm_profiles={"default": chat_config, "embedding": embed_config},
         database_config=db_config,
         memorize_config=memorize_config,
+        user_config=user_config,
     )
 
 
-def _read_last_sync() -> float:
+def _agent_memory_enabled(agent_name: str) -> bool:
+    settings = parse_agent_settings_from_env()
+    policy = resolve_agent_policy(agent_name, settings)
+    return bool(policy["memoryEnabled"])
+
+
+def _read_last_sync(agent_name: str | None = None) -> float:
     try:
-        with open(_get_sync_marker_path(), "r", encoding="utf-8") as f:
+        with open(_get_sync_marker_path(agent_name), "r", encoding="utf-8") as f:
             return float(f.read().strip() or "0")
     except Exception:
         return 0.0
 
 
-def _write_last_sync(ts: float) -> None:
-    marker = _get_sync_marker_path()
+def _write_last_sync(ts: float, agent_name: str | None = None) -> None:
+    marker = _get_sync_marker_path(agent_name)
     os.makedirs(os.path.dirname(marker), exist_ok=True)
     with open(marker, "w", encoding="utf-8") as f:
         f.write(str(ts))
 
 
-def _main_session_file_exists() -> bool:
+def _main_session_file_exists(agent_name: str) -> bool:
     """Best-effort check: does OpenClaw main session jsonl exist right now?
 
     IMPORTANT: If the main session file is temporarily missing (startup race / rotation),
@@ -403,14 +460,11 @@ def _main_session_file_exists() -> bool:
     sessions_dir = os.getenv("OPENCLAW_SESSIONS_DIR")
     if not sessions_dir:
         return False
-    sessions_json = os.path.join(sessions_dir, "sessions.json")
     try:
-        with open(sessions_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        main_id = (data.get("agent:main:main") or {}).get("sessionId")
-        if not main_id:
-            return False
-        return os.path.exists(os.path.join(sessions_dir, f"{main_id}.jsonl"))
+        from convert_sessions import discover_session_files
+
+        discovered = discover_session_files(sessions_dir, [agent_name])
+        return bool(discovered.get(agent_name))
     except Exception:
         return False
 
@@ -424,18 +478,19 @@ async def sync_once(user_id: str = "default") -> None:
         return
 
     try:
-        last_sync = _read_last_sync()
+        current_agent = _current_agent_name()
+        last_sync = _read_last_sync(current_agent)
         sync_start_ts = time.time()
 
         # Load any previously converted-but-not-ingested parts.
         # This prevents data loss when convert() advances its internal state.json
         # but downstream memorize() fails mid-batch.
-        pending_paths = _load_pending_ingest()
+        pending_paths = _load_pending_ingest(current_agent)
 
         # 1) Convert updated OpenClaw session jsonl -> memU JSON resources
         # NOTE: convert() may return [] if the main session file is temporarily missing.
         # In that case, do NOT advance last_sync_ts; otherwise we can skip content.
-        converted_paths = convert(since_ts=last_sync)
+        converted_paths = convert(since_ts=last_sync, agent_name=current_agent)
 
         # Optional salvage path: when watcher detects a /new switch,
         # it passes the previous main session id. Force-finalize any staged tail
@@ -447,6 +502,7 @@ async def sync_once(user_id: str = "default") -> None:
                     since_ts=last_sync,
                     session_id=prev_main_session_id,
                     force_flush=True,
+                    agent_name=current_agent,
                 )
                 if salvage_paths:
                     _log(
@@ -458,7 +514,11 @@ async def sync_once(user_id: str = "default") -> None:
                     f"salvage failed for previous main session ({prev_main_session_id}): {type(e).__name__}: {e}"
                 )
 
-        if not converted_paths and not pending_paths and not _main_session_file_exists():
+        if (
+            not converted_paths
+            and not pending_paths
+            and not _main_session_file_exists(current_agent)
+        ):
             _log(
                 "main session file missing/unavailable; skip updating sync cursor to avoid data loss"
             )
@@ -474,9 +534,9 @@ async def sync_once(user_id: str = "default") -> None:
                 continue
             seen.add(p)
             merged.append(p)
-        _save_pending_ingest(merged)
+        _save_pending_ingest(merged, current_agent)
 
-        backoff = _load_backoff_state()
+        backoff = _load_backoff_state(current_agent)
         now_ts = time.time()
         next_retry_ts = float(backoff.get("next_retry_ts", 0.0) or 0.0)
 
@@ -492,16 +552,17 @@ async def sync_once(user_id: str = "default") -> None:
             return
 
         if not merged:
-            if _should_log_empty_sync():
+            if _should_log_empty_sync(current_agent):
                 _log("no updated sessions to ingest.")
-            _write_last_sync(sync_start_ts)
+            _write_last_sync(sync_start_ts, current_agent)
             _save_backoff_state(
-                {"next_retry_ts": 0.0, "consecutive_rate_limits": 0, "reason": ""}
+                {"next_retry_ts": 0.0, "consecutive_rate_limits": 0, "reason": ""},
+                current_agent,
             )
             return
 
         # 2) Ingest converted conversations into memU
-        service = build_service()
+        services: dict[str, MemoryService] = {}
         _log(
             "sync llm profiles: "
             f"chat={_env('MEMU_CHAT_PROVIDER', 'openai')}/{_env('MEMU_CHAT_MODEL', 'unknown')} "
@@ -519,8 +580,13 @@ async def sync_once(user_id: str = "default") -> None:
 
         remaining: list[str] = []
         for p in merged:
+            agent_name = current_agent
+            if not _agent_memory_enabled(agent_name):
+                _log(f"skip disabled agent memory: {agent_name} ({os.path.basename(p)})")
+                continue
+
             # Check if resource already exists to skip re-ingestion
-            if resource_exists(p, user_id):
+            if resource_exists(p, user_id, agent_name):
                 _log(f"skip existing: {os.path.basename(p)}")
                 continue
 
@@ -528,11 +594,15 @@ async def sync_once(user_id: str = "default") -> None:
                 base = os.path.basename(p)
                 t0 = time.time()
                 _log(f"ingest: {base}")
+                service = services.get(agent_name)
+                if service is None:
+                    service = build_service(agent_name)
+                    services[agent_name] = service
                 await asyncio.wait_for(
                     service.memorize(
                         resource_url=p,
                         modality="conversation",
-                        user={"user_id": user_id},
+                        user={"user_id": user_id, "agentName": agent_name},
                     ),
                     timeout=timeout_s,
                 )
@@ -549,15 +619,22 @@ async def sync_once(user_id: str = "default") -> None:
                 if _is_rate_limited_error(e):
                     saw_rate_limit = True
 
+        for service in services.values():
+            try:
+                service.database.close()
+            except Exception:
+                pass
+
         _log(f"sync complete. success={ok}, failed={fail}")
 
         # Persist remaining queue and advance cursor only when everything is ingested.
-        _save_pending_ingest(remaining)
+        _save_pending_ingest(remaining, current_agent)
 
         if fail == 0:
-            _write_last_sync(sync_start_ts)
+            _write_last_sync(sync_start_ts, current_agent)
             _save_backoff_state(
-                {"next_retry_ts": 0.0, "consecutive_rate_limits": 0, "reason": ""}
+                {"next_retry_ts": 0.0, "consecutive_rate_limits": 0, "reason": ""},
+                current_agent,
             )
         else:
             _log("sync cursor not advanced due to failures")
@@ -572,7 +649,8 @@ async def sync_once(user_id: str = "default") -> None:
                         "next_retry_ts": next_retry_ts,
                         "consecutive_rate_limits": consecutive_rate_limits,
                         "reason": "rate_limit",
-                    }
+                    },
+                    current_agent,
                 )
                 _log(
                     f"rate-limit backoff set: {wait_s}s (attempt={consecutive_rate_limits}, next_retry_ts={next_retry_ts})"
@@ -582,5 +660,15 @@ async def sync_once(user_id: str = "default") -> None:
 
 
 if __name__ == "__main__":
+    try:
+        migration = migrate_legacy_single_db_to_agent_db(default_agent="main")
+        if migration.migrated:
+            _log(
+                f"Legacy DB auto-migrated: {migration.source_db} -> {migration.target_db} "
+                f"(backup={migration.backup_path})"
+            )
+    except Exception as e:
+        _log(f"Migration check failed: {e}")
+    
     user_id = _env("MEMU_USER_ID", "default") or "default"
     asyncio.run(sync_once(user_id=user_id))

@@ -80,6 +80,36 @@
           }
         },
         "additionalProperties": true
+      },
+      "memoryRoot": {
+        "type": "string",
+        "description": "Hybrid memory root directory. Default: ~/.openclaw/memUdata/memory"
+      },
+      "agentSettings": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "memoryEnabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether this agent writes/updates structured memory."
+            },
+            "searchEnabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether this agent can call memory_search."
+            },
+            "searchableStores": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": ["self"],
+              "description": "Search targets: self, shared, or explicit agent names."
+            }
+          }
+        },
+        "default": {},
+        "description": "Per-agent memory policy settings."
       }
     }
   }

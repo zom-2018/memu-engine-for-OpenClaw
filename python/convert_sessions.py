@@ -15,10 +15,13 @@ Key behaviors:
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 import time
+import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 _sessions_dir = os.getenv("OPENCLAW_SESSIONS_DIR")
@@ -30,11 +33,56 @@ _memu_data_dir = os.getenv("MEMU_DATA_DIR")
 if not _memu_data_dir:
     raise ValueError("MEMU_DATA_DIR env var is not set")
 memu_data_dir: str = _memu_data_dir
-OUT_DIR = os.path.join(memu_data_dir, "conversations")
-STATE_PATH = os.path.join(OUT_DIR, "state.json")
+CONVERSATIONS_ROOT_DIR = os.path.join(memu_data_dir, "conversations")
+STATE_ROOT_DIR = os.path.join(memu_data_dir, "state", "convert")
 STATE_VERSION = 4
 
 SAMPLE_BYTES = 64 * 1024
+
+logger = logging.getLogger(__name__)
+
+
+def _conversation_dir(agent_name: str) -> str:
+    return os.path.join(CONVERSATIONS_ROOT_DIR, agent_name)
+
+
+def _legacy_conversation_dir() -> str:
+    return CONVERSATIONS_ROOT_DIR
+
+
+def _state_path(agent_name: str) -> str:
+    return os.path.join(STATE_ROOT_DIR, f"{agent_name}.json")
+
+
+def _legacy_state_path() -> str:
+    return os.path.join(CONVERSATIONS_ROOT_DIR, "state.json")
+
+SESSION_FILENAME_RE = re.compile(
+    r"^(?P<session_id>.+?)\.jsonl(?:\.deleted\.(?P<deleted_ts>.+))?$"
+)
+DELETED_GLOB = "*.jsonl.deleted.*"
+UUID_SESSION_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _extract_session_id(filename: str) -> str | None:
+    m = SESSION_FILENAME_RE.match(filename)
+    if not m:
+        return None
+    session_id = m.group("session_id")
+    return session_id if session_id else None
+
+
+def _extract_deleted_timestamp(filename: str) -> str:
+    m = SESSION_FILENAME_RE.match(filename)
+    if not m:
+        return ""
+    return m.group("deleted_ts") or ""
+
+
+def _is_main_session(session_id: str) -> bool:
+    return bool(UUID_SESSION_RE.match(session_id or ""))
 
 # Scheme 3 (tail gating): keep an appendable tail buffer that is NOT ingested until finalized.
 # Finalize when either:
@@ -75,16 +123,158 @@ def _get_language_prefix() -> str | None:
     return f"[Language Context: All memory summaries extracted from this conversation must be written in {lang}.]"
 
 
-def _get_main_session_id() -> str | None:
-    """Get the main session ID from sessions.json registry."""
-    sessions_path = os.path.join(sessions_dir, "sessions.json")
-    try:
-        with open(sessions_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        main_entry = data.get("agent:main:main", {})
-        return main_entry.get("sessionId")
-    except Exception:
+def discover_session_files(data_root: str | Path, agents: list[str]) -> dict[str, str]:
+    root_input = Path(data_root).expanduser()
+    sessions_roots: list[Path] = []
+    if root_input.name == "sessions":
+        sessions_roots.append(root_input)
+    sessions_roots.append(root_input / "sessions")
+
+    deduped_roots: list[Path] = []
+    seen_roots: set[str] = set()
+    for root in sessions_roots:
+        key = str(root)
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        deduped_roots.append(root)
+
+    enabled_agents = [a.strip() for a in agents if isinstance(a, str) and a.strip()]
+    enabled_agents = list(dict.fromkeys(enabled_agents))
+    if not enabled_agents:
+        return {}
+
+    def _load_sessions_json(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except PermissionError:
+            logger.warning(f"sessions index is not accessible: {path}")
+            return None
+        except json.JSONDecodeError as exc:
+            logger.warning(f"sessions index is invalid JSON: {path} ({exc})")
+            return None
+        except OSError as exc:
+            logger.warning(f"failed reading sessions index: {path} ({exc})")
+            return None
+
+        if not isinstance(payload, dict):
+            logger.warning(f"sessions index has unexpected format (expected object): {path}")
+            return None
+        return payload
+
+    def _extract_session_id_for_agent(payload: dict[str, Any], agent_name: str) -> str | None:
+        for key, value in payload.items():
+            if not isinstance(key, str) or not key.startswith(f"agent:{agent_name}:"):
+                continue
+            if not isinstance(value, dict):
+                continue
+            session_id = value.get("sessionId")
+            if isinstance(session_id, str) and session_id.strip():
+                return session_id.strip()
         return None
+
+    out: dict[str, str] = {}
+    legacy_cache: dict[str, dict[str, Any] | None] = {}
+
+    for agent_name in enabled_agents:
+        resolved = False
+
+        for sessions_root in deduped_roots:
+            per_agent_index = sessions_root / agent_name / "sessions.json"
+            payload = _load_sessions_json(per_agent_index)
+            if payload is None:
+                continue
+
+            session_id = _extract_session_id_for_agent(payload, agent_name)
+            if not session_id:
+                logger.warning(
+                    f"no session id found for agent '{agent_name}' in {per_agent_index}"
+                )
+                continue
+
+            transcript_candidates = [
+                sessions_root / agent_name / f"{session_id}.jsonl",
+                sessions_root / f"{session_id}.jsonl",
+            ]
+            for candidate in transcript_candidates:
+                if candidate.exists():
+                    out[agent_name] = str(candidate)
+                    resolved = True
+                    break
+
+            if not resolved:
+                logger.warning(
+                    f"session file missing for agent '{agent_name}': "
+                    f"{transcript_candidates[0]}"
+                )
+            if resolved:
+                break
+
+        if resolved:
+            continue
+
+        for sessions_root in deduped_roots:
+            legacy_index = sessions_root / "sessions.json"
+            cache_key = str(legacy_index)
+            if cache_key not in legacy_cache:
+                legacy_cache[cache_key] = _load_sessions_json(legacy_index)
+            payload = legacy_cache[cache_key]
+            if payload is None:
+                continue
+
+            session_id = _extract_session_id_for_agent(payload, agent_name)
+            if not session_id:
+                continue
+
+            transcript_candidates = [
+                sessions_root / f"{session_id}.jsonl",
+                sessions_root / agent_name / f"{session_id}.jsonl",
+            ]
+            for candidate in transcript_candidates:
+                if candidate.exists():
+                    out[agent_name] = str(candidate)
+                    resolved = True
+                    break
+
+            if not resolved:
+                logger.warning(
+                    f"legacy session file missing for agent '{agent_name}': "
+                    f"{transcript_candidates[0]}"
+                )
+            if resolved:
+                break
+
+    return out
+
+
+def _get_agent_session_ids(sessions_dir: str, agent_name: str) -> list[str]:
+    """
+    获取指定 agent 的所有 session IDs。
+
+    Args:
+        sessions_dir: sessions 目录路径
+        agent_name: agent 名称 (例如 "main", "prometheus")
+
+    Returns:
+        session ID 列表
+    """
+    discovered = discover_session_files(sessions_dir, [agent_name])
+    session_file = discovered.get(agent_name)
+    if not session_file:
+        return []
+
+    session_id = _extract_session_id(os.path.basename(session_file))
+    if session_id:
+        return [session_id]
+    return [Path(session_file).stem]
+
+
+def _get_main_session_id(agent_name: str = "main") -> str | None:
+    session_ids = _get_agent_session_ids(sessions_dir, agent_name)
+    return session_ids[0] if session_ids else None
 
 
 def _resolve_session_file(session_id: str) -> str | None:
@@ -291,41 +481,56 @@ def _sha256_file_sample(*, file_path: str, start: int, length: int) -> str:
         return ""
 
 
-def _load_state() -> dict[str, Any]:
-    if not os.path.exists(STATE_PATH):
-        return {"version": STATE_VERSION, "sessions": {}}
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        ver = s.get("version")
-        # Migrate v3 -> v4 in-place to avoid reprocessing and (critically) avoid
-        # overwriting already-ingested part files with different chunk sizing.
-        if ver == 3 and STATE_VERSION == 4:
-            return {
-                "version": STATE_VERSION,
-                "sessions": s.get("sessions", {}),
-            }
-        if ver != STATE_VERSION:
-            return {"version": STATE_VERSION, "sessions": {}}
-        return {"version": STATE_VERSION, "sessions": s.get("sessions", {})}
-    except Exception:
-        return {"version": STATE_VERSION, "sessions": {}}
+def _load_state(
+    *, state_path: str | None = None, legacy_state_path: str | None = None
+) -> dict[str, Any]:
+    resolved_state_path = state_path or _legacy_state_path()
+    candidates: list[str] = [resolved_state_path]
+    if legacy_state_path and legacy_state_path != resolved_state_path:
+        candidates.append(legacy_state_path)
+    if resolved_state_path not in candidates:
+        candidates.insert(0, resolved_state_path)
+
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            ver = s.get("version")
+            # Migrate v3 -> v4 in-place to avoid reprocessing and (critically) avoid
+            # overwriting already-ingested part files with different chunk sizing.
+            if ver == 3 and STATE_VERSION == 4:
+                return {
+                    "version": STATE_VERSION,
+                    "sessions": s.get("sessions", {}),
+                }
+            if ver != STATE_VERSION:
+                return {"version": STATE_VERSION, "sessions": {}}
+            return {"version": STATE_VERSION, "sessions": s.get("sessions", {})}
+        except Exception:
+            continue
+
+    return {"version": STATE_VERSION, "sessions": {}}
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
+def _save_state(state: dict[str, Any], *, state_path: str | None = None) -> None:
+    resolved_state_path = state_path or _legacy_state_path()
+    os.makedirs(os.path.dirname(resolved_state_path), exist_ok=True)
+    tmp = resolved_state_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, resolved_state_path)
 
 
-def _part_path(session_id: str, part_idx: int) -> str:
-    return os.path.join(OUT_DIR, f"{session_id}.part{part_idx:03d}.json")
+def _part_path(session_id: str, part_idx: int, *, out_dir: str | None = None) -> str:
+    resolved_out_dir = out_dir or _legacy_conversation_dir()
+    return os.path.join(resolved_out_dir, f"{session_id}.part{part_idx:03d}.json")
 
 
-def _tail_tmp_path(session_id: str) -> str:
-    return os.path.join(OUT_DIR, f"{session_id}.tail.tmp.json")
+def _tail_tmp_path(session_id: str, *, out_dir: str | None = None) -> str:
+    resolved_out_dir = out_dir or _legacy_conversation_dir()
+    return os.path.join(resolved_out_dir, f"{session_id}.tail.tmp.json")
 
 
 def _read_part_messages(part_path: str) -> list[dict[str, str]]:
@@ -459,6 +664,8 @@ def convert(
     *,
     since_ts: float | None = None,
     session_id: str | None = None,
+    agent_name: str | None = None,
+    memory_root: str | Path | None = None,
     force_flush: bool = False,
 ) -> list[str]:
     """Convert one OpenClaw session transcript to memU conversation parts.
@@ -466,28 +673,54 @@ def convert(
     - default: current main session from sessions.json
     - optional: explicit session_id (used to salvage reset/archived sessions)
     """
-    os.makedirs(OUT_DIR, exist_ok=True)
+    try:
+        from memu.storage_layout import memory_root_path as _memory_root_path
+
+        resolved_memory_root = str(_memory_root_path(memory_root))
+    except Exception:
+        fallback_root = (
+            Path(memory_root).expanduser()
+            if memory_root is not None
+            else Path(
+                os.getenv("MEMU_MEMORY_ROOT", "~/.openclaw/memUdata/memory")
+            ).expanduser()
+        )
+        resolved_memory_root = str(fallback_root)
+    os.environ["MEMU_MEMORY_ROOT"] = resolved_memory_root
 
     # Default to 60 messages per finalized part (Scheme 4).
     max_messages = int(os.getenv("MEMU_MAX_MESSAGES_PER_SESSION", "60") or "60")
 
-    target_session_id = session_id or _get_main_session_id()
-    if not target_session_id:
-        print(
-            "[convert_sessions] No main session found in sessions.json",
-            file=__import__("sys").stderr,
+    resolved_agent = (agent_name or os.getenv("MEMU_AGENT_NAME") or "main").strip() or "main"
+    out_dir = _conversation_dir(resolved_agent)
+    legacy_out_dir = _legacy_conversation_dir()
+    state_path = _state_path(resolved_agent)
+    legacy_state_path = _legacy_state_path()
+    os.makedirs(out_dir, exist_ok=True)
+    if session_id:
+        target_session_id = session_id
+        session_file = _resolve_session_file(target_session_id)
+        if not session_file:
+            print(
+                f"[convert_sessions] Session file not found for: {target_session_id}",
+                file=__import__("sys").stderr,
+            )
+            return []
+    else:
+        discovered = discover_session_files(sessions_dir, [resolved_agent])
+        session_file = discovered.get(resolved_agent)
+        if not session_file:
+            print(
+                f"[convert_sessions] No session found in sessions indexes for agent: {resolved_agent}",
+                file=__import__("sys").stderr,
+            )
+            return []
+        target_session_id = (
+            _extract_session_id(os.path.basename(session_file))
+            or Path(session_file).stem
         )
-        return []
 
-    session_file = _resolve_session_file(target_session_id)
-    if not session_file:
-        print(
-            f"[convert_sessions] Session file not found for: {target_session_id}",
-            file=__import__("sys").stderr,
-        )
-        return []
-
-    state = _load_state()
+    state = _load_state(state_path=state_path, legacy_state_path=legacy_state_path)
     sessions_state: dict[str, Any] = state.setdefault("sessions", {})
     converted: list[str] = []
     lang_prefix = _get_language_prefix()
@@ -498,7 +731,7 @@ def convert(
     try:
         st = os.stat(file_path)
     except FileNotFoundError:
-        _save_state(state)
+        _save_state(state, state_path=state_path)
         return converted
 
     prev = sessions_state.get(session_id) if isinstance(sessions_state, dict) else None
@@ -545,7 +778,7 @@ def convert(
         # Even if the session file hasn't changed, we may still need to finalize a staged tail
         # after the idle window.
         if (not prev or cur_size <= prev_offset) and not _should_idle_flush(prev):
-            _save_state(state)
+            _save_state(state, state_path=state_path)
             return converted
 
     append_only = True
@@ -571,22 +804,35 @@ def convert(
             append_only = False
 
     def _load_tail_messages() -> list[dict[str, str]]:
-        tail_path = _tail_tmp_path(session_id)
-        try:
-            tail_part = _read_part_messages(tail_path)
-            return _strip_system_prefix(tail_part, lang_prefix)
-        except FileNotFoundError:
-            return []
-        except Exception:
-            return []
+        candidates = [
+            _tail_tmp_path(session_id, out_dir=out_dir),
+            _tail_tmp_path(session_id, out_dir=legacy_out_dir),
+        ]
+        seen: set[str] = set()
+        for tail_path in candidates:
+            if tail_path in seen:
+                continue
+            seen.add(tail_path)
+            try:
+                tail_part = _read_part_messages(tail_path)
+                return _strip_system_prefix(tail_part, lang_prefix)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        return []
 
     def _write_tail_messages(msgs: list[dict[str, str]]) -> None:
-        tail_path = _tail_tmp_path(session_id)
+        tail_path = _tail_tmp_path(session_id, out_dir=out_dir)
         if not msgs:
-            try:
-                os.remove(tail_path)
-            except FileNotFoundError:
-                pass
+            for candidate in {
+                tail_path,
+                _tail_tmp_path(session_id, out_dir=legacy_out_dir),
+            }:
+                try:
+                    os.remove(candidate)
+                except FileNotFoundError:
+                    pass
             return
         _write_part_json(
             part_messages=msgs, out_path=tail_path, lang_prefix=lang_prefix
@@ -615,7 +861,7 @@ def convert(
         while len(buf) >= max_messages:
             chunk = buf[:max_messages]
             buf = buf[max_messages:]
-            out_path = _part_path(session_id, part_count_in)
+            out_path = _part_path(session_id, part_count_in, out_dir=out_dir)
             changed, _ = _write_part_json(
                 part_messages=chunk, out_path=out_path, lang_prefix=lang_prefix
             )
@@ -625,7 +871,7 @@ def convert(
 
         # If idle-flush and there is remainder (< max_messages), flush remainder as its own part.
         if buf and is_idle:
-            out_path = _part_path(session_id, part_count_in)
+            out_path = _part_path(session_id, part_count_in, out_dir=out_dir)
             changed, _ = _write_part_json(
                 part_messages=buf, out_path=out_path, lang_prefix=lang_prefix
             )
@@ -646,7 +892,7 @@ def convert(
 
         new_part_count = 0
         if max_messages <= 0:
-            out_path = os.path.join(OUT_DIR, f"{session_id}.json")
+            out_path = os.path.join(out_dir, f"{session_id}.json")
             changed, _ = _write_part_json(
                 part_messages=messages, out_path=out_path, lang_prefix=lang_prefix
             )
@@ -659,7 +905,7 @@ def convert(
             for part_idx in range(full_count):
                 start = part_idx * max_messages
                 end = start + max_messages
-                part_path = _part_path(session_id, part_idx)
+                part_path = _part_path(session_id, part_idx, out_dir=out_dir)
                 changed, _ = _write_part_json(
                     part_messages=messages[start:end],
                     out_path=part_path,
@@ -673,7 +919,7 @@ def convert(
             tail_msgs = messages[full_count * max_messages :]
             if tail_msgs and _should_idle_flush({"tail_part_messages": len(tail_msgs)}):
                 # Session is already idle; finalize remainder immediately to avoid leaving tail forever.
-                part_path = _part_path(session_id, new_part_count)
+                part_path = _part_path(session_id, new_part_count, out_dir=out_dir)
                 changed, _ = _write_part_json(
                     part_messages=tail_msgs, out_path=part_path, lang_prefix=lang_prefix
                 )
@@ -688,7 +934,7 @@ def convert(
         if max_messages > 0 and prev_part_count and new_part_count < prev_part_count:
             for part_idx in range(new_part_count, prev_part_count):
                 try:
-                    os.remove(_part_path(session_id, part_idx))
+                    os.remove(_part_path(session_id, part_idx, out_dir=out_dir))
                 except FileNotFoundError:
                     pass
 
@@ -706,7 +952,7 @@ def convert(
             if new_part_count > 0:
                 try:
                     last_msgs = _read_part_messages(
-                        os.path.join(OUT_DIR, f"{session_id}.json")
+                        os.path.join(out_dir, f"{session_id}.json")
                     )
                     tail_count = len(_strip_system_prefix(last_msgs, lang_prefix))
                 except Exception:
@@ -726,7 +972,7 @@ def convert(
             "head_sha256": head_sha,
             "tail_sha256": tail_sha,
         }
-        _save_state(state)
+        _save_state(state, state_path=state_path)
         return converted
 
     if cur_size == prev_offset:
@@ -747,20 +993,20 @@ def convert(
                     "part_count": int(part_count2),
                     "tail_part_messages": 0,
                 }
-        _save_state(state)
+        _save_state(state, state_path=state_path)
         return converted
 
     read_res = _read_messages_from_jsonl(file_path=file_path, start_offset=prev_offset)
     new_messages = read_res.messages
     if not new_messages and read_res.new_offset == prev_offset:
-        _save_state(state)
+        _save_state(state, state_path=state_path)
         return converted
 
     part_count = prev_part_count
     tail_count = prev_tail_count
 
     if max_messages <= 0:
-        out_path = os.path.join(OUT_DIR, f"{session_id}.json")
+        out_path = os.path.join(out_dir, f"{session_id}.json")
         full_res = _read_messages_from_jsonl(file_path=file_path, start_offset=0)
         changed, _ = _write_part_json(
             part_messages=full_res.messages,
@@ -781,7 +1027,7 @@ def convert(
         while len(tail_buf) >= max_messages:
             chunk = tail_buf[:max_messages]
             tail_buf = tail_buf[max_messages:]
-            part_path = _part_path(session_id, part_count)
+            part_path = _part_path(session_id, part_count, out_dir=out_dir)
             changed, _ = _write_part_json(
                 part_messages=chunk, out_path=part_path, lang_prefix=lang_prefix
             )
@@ -794,7 +1040,7 @@ def convert(
             {"tail_part_messages": len(tail_buf)}
         )
         if did_flush_idle:
-            part_path = _part_path(session_id, part_count)
+            part_path = _part_path(session_id, part_count, out_dir=out_dir)
             changed, _ = _write_part_json(
                 part_messages=tail_buf, out_path=part_path, lang_prefix=lang_prefix
             )
@@ -831,15 +1077,55 @@ def convert(
         "tail_sha256": tail_sha,
     }
 
-    _save_state(state)
+    _save_state(state, state_path=state_path)
     return converted
+
+
+def convert_agents(
+    *,
+    agents: list[str],
+    since_ts: float | None = None,
+    memory_root: str | Path | None = None,
+    force_flush: bool = False,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {"success": [], "failed": [], "errors": [], "paths": {}}
+
+    for agent_name in agents:
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            continue
+        resolved_agent = agent_name.strip()
+        try:
+            converted_paths = convert(
+                since_ts=since_ts,
+                agent_name=resolved_agent,
+                memory_root=memory_root,
+                force_flush=force_flush,
+            )
+            results["success"].append(resolved_agent)
+            results["paths"][resolved_agent] = converted_paths
+        except Exception as exc:
+            tb = traceback.format_exc()
+            err = {
+                "agent": resolved_agent,
+                "error": str(exc),
+                "traceback": tb,
+            }
+            logger.exception(
+                "per-agent conversion failed",
+                extra={"agent": resolved_agent, "operation": "convert"},
+            )
+            results["failed"].append({"agent": resolved_agent, "error": str(exc)})
+            results["errors"].append(err)
+
+    return results
 
 
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "--debug":
-        main_id = _get_main_session_id()
+        current_agent = (os.getenv("MEMU_AGENT_NAME") or "main").strip() or "main"
+        main_id = _get_main_session_id(current_agent)
         print(f"Main session ID: {main_id}")
         if main_id:
             main_file = os.path.join(sessions_dir, f"{main_id}.jsonl")
@@ -847,8 +1133,11 @@ if __name__ == "__main__":
             print(f"Exists: {os.path.exists(main_file)}")
         sys.exit(0)
 
-    paths = convert()
-    print(f"Converted main session into {len(paths)} part(s) in {OUT_DIR}.")
+    current_agent = (os.getenv("MEMU_AGENT_NAME") or "main").strip() or "main"
+    paths = convert(agent_name=current_agent)
+    print(
+        f"Converted main session into {len(paths)} part(s) in {_conversation_dir(current_agent)}."
+    )
     for p in paths[:20]:
         print(f"- {p}")
     if len(paths) > 20:

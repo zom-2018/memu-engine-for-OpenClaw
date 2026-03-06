@@ -1,7 +1,17 @@
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, RootModel, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    Field,
+    RootModel,
+    StringConstraints,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from memu.prompts.category_summary import (
     DEFAULT_CATEGORY_SUMMARY_PROMPT_ORDINAL,
@@ -319,3 +329,26 @@ class DatabaseConfig(BaseModel):
                 self.vector_index = VectorIndexConfig(provider="bruteforce")
         elif self.vector_index.provider == "pgvector" and self.vector_index.dsn is None:
             self.vector_index = self.vector_index.model_copy(update={"dsn": self.metadata_store.dsn})
+
+
+class MemUConfig(BaseModel):
+    chunkSize: int = Field(
+        default=512,
+        gt=0,
+        le=2048,
+        description="Chunk size for document segmentation (must be 1..2048).",
+    )
+    chunkOverlap: int = Field(
+        default=50,
+        ge=0,
+        description="Token overlap between chunks (must be >= 0 and < chunkSize).",
+    )
+
+    @field_validator("chunkOverlap")
+    @classmethod
+    def validate_chunk_overlap(cls, value: int, info: ValidationInfo) -> int:
+        chunk_size = info.data.get("chunkSize")
+        if isinstance(chunk_size, int) and value >= chunk_size:
+            msg = "chunkOverlap must be less than chunkSize"
+            raise ValueError(msg)
+        return value

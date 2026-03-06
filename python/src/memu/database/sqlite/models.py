@@ -221,6 +221,10 @@ def build_sqlite_table_model(
         table_args.append(
             Index(f"ix_{tablename}__unique_scoped", *unique_cols, unique=True)
         )
+    if tablename == "memu_memory_items" and {"agent_id", "user_id"}.issubset(
+        set(scope_fields)
+    ):
+        table_args.append(Index("idx_agent_scope", "agent_id", "user_id"))
 
     base_attrs: dict[str, Any] = {
         "__module__": core_model.__module__,

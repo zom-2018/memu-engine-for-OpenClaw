@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import json
 import sqlite3
@@ -9,10 +10,16 @@ from memu.app.settings import (
     CustomPrompt,
     DatabaseConfig,
     LLMConfig,
+    MemUConfig,
     MemorizeConfig,
     MetadataStoreConfig,
     PromptBlock,
 )
+from memu.database.hybrid_factory import HybridDatabaseManager
+from memu.database.lazy_db import execute_with_locked_retry, fetch_with_locked_retry
+from memu.scope_model import AgentScopeModel
+from memu.storage_layout import migrate_legacy_single_db_to_agent_db
+from memu.storage_layout import agent_db_dsn
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -30,7 +37,9 @@ def _log(msg: str) -> None:
     if not data_dir:
         return
     try:
-        with open(os.path.join(data_dir, "sync.log"), "a", encoding="utf-8") as f:
+        state_dir = os.path.join(data_dir, "state")
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "sync.log"), "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -199,49 +208,117 @@ def get_db_dsn() -> str:
     return f"sqlite:///{os.path.join(data_dir, 'memu.db')}"
 
 
-def _db_has_column(conn: sqlite3.Connection, *, table: str, column: str) -> bool:
+def _is_same_mtime(stored_mtime: object, file_mtime: float, *, tolerance: float = 1e-6) -> bool:
     try:
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [row[1] for row in cur.fetchall() if len(row) > 1]
-        return column in set(cols)
-    except Exception:
+        if stored_mtime is None:
+            return False
+        return abs(float(stored_mtime if isinstance(stored_mtime, (int, float, str)) else 0.0) - float(file_mtime)) <= tolerance
+    except (TypeError, ValueError):
         return False
 
 
-def _resource_exists(resource_url: str, *, user_id: str) -> bool:
-    try:
-        data_dir = os.getenv("MEMU_DATA_DIR")
-        if not data_dir:
-            return False
-        db_path = os.path.join(data_dir, "memu.db")
-        if not os.path.exists(db_path):
-            return False
+def _calculate_content_hash(file_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='memu_resources'"
+
+def _get_shared_document_rows(manager: HybridDatabaseManager, *, filename: str, owner_agent_id: str) -> list[tuple[object, ...]]:
+    db = manager.get_shared_db()
+    rows = fetch_with_locked_retry(
+        db,
+        (
+            "SELECT id, content_hash, mtime "
+            "FROM documents "
+            "WHERE filename = ? AND owner_agent_id = ? "
+            "ORDER BY created_at DESC"
+        ),
+        (filename, owner_agent_id),
+    )
+    return rows
+
+
+def _shared_document_exists(
+    manager: HybridDatabaseManager,
+    *,
+    filename: str,
+    owner_agent_id: str,
+    content_hash: str,
+    mtime: float,
+) -> tuple[bool, list[str], list[str]]:
+    rows = _get_shared_document_rows(manager, filename=filename, owner_agent_id=owner_agent_id)
+    if not rows:
+        return False, [], []
+
+    doc_ids = [str(row[0]) for row in rows if row and row[0]]
+    all_legacy = all((not row[1]) or (row[2] is None) for row in rows)
+    if all_legacy:
+        return True, doc_ids, []
+
+    for row in rows:
+        if len(row) < 3:
+            continue
+        row_hash = row[1]
+        row_mtime = row[2]
+        if row_hash == content_hash and _is_same_mtime(row_mtime, mtime):
+            return True, [], []
+
+    return False, [], doc_ids
+
+
+def _backfill_document_metadata(
+    manager: HybridDatabaseManager,
+    *,
+    document_ids: list[str],
+    content_hash: str,
+    mtime: float,
+) -> None:
+    if not document_ids:
+        return
+    db = manager.get_shared_db()
+    for document_id in document_ids:
+        execute_with_locked_retry(
+            db,
+            "UPDATE documents SET content_hash = ?, mtime = ? WHERE id = ?",
+            (content_hash, mtime, document_id),
         )
-        if cur.fetchone() is None:
-            conn.close()
-            return False
 
-        if _db_has_column(conn, table="memu_resources", column="user_id"):
-            cur.execute(
-                "SELECT 1 FROM memu_resources WHERE url = ? AND user_id = ? LIMIT 1",
-                (resource_url, user_id),
-            )
-        else:
-            cur.execute(
-                "SELECT 1 FROM memu_resources WHERE url = ? LIMIT 1",
-                (resource_url,),
-            )
-        exists = cur.fetchone() is not None
-        conn.close()
-        return exists
-    except Exception:
-        return False
+
+def _delete_documents_and_chunks(manager: HybridDatabaseManager, *, document_ids: list[str]) -> None:
+    if not document_ids:
+        return
+    db = manager.get_shared_db()
+    for document_id in document_ids:
+        execute_with_locked_retry(
+            db,
+            "DELETE FROM document_chunks WHERE document_id = ?",
+            (document_id,),
+        )
+        execute_with_locked_retry(
+            db,
+            "DELETE FROM documents WHERE id = ?",
+            (document_id,),
+        )
+
+
+def _persist_document_metadata(
+    manager: HybridDatabaseManager,
+    *,
+    document_id: str,
+    content_hash: str,
+    mtime: float,
+) -> None:
+    db = manager.get_shared_db()
+    execute_with_locked_retry(
+        db,
+        "UPDATE documents SET content_hash = ?, mtime = ? WHERE id = ?",
+        (content_hash, mtime, document_id),
+    )
 
 
 def get_extra_paths() -> list[str]:
@@ -259,7 +336,7 @@ def _full_scan_marker_path() -> str | None:
     data_dir = os.getenv("MEMU_DATA_DIR")
     if not data_dir:
         return None
-    return os.path.join(data_dir, "docs_full_scan.marker")
+    return os.path.join(data_dir, "state", "docs_full_scan.marker")
 
 
 async def main():
@@ -270,7 +347,9 @@ async def main():
         return
 
     try:
+        migrate_legacy_single_db_to_agent_db(default_agent="main")
         user_id = _env("MEMU_USER_ID", "default") or "default"
+        owner_agent = _env("MEMU_DOC_OWNER_AGENT", "main") or "main"
 
         chat_kwargs = {}
         if p := _env("MEMU_CHAT_PROVIDER"):
@@ -297,7 +376,7 @@ async def main():
         db_config = DatabaseConfig(
             metadata_store=MetadataStoreConfig(
                 provider="sqlite",
-                dsn=get_db_dsn(),
+                dsn=agent_db_dsn(owner_agent),
             )
         )
 
@@ -308,6 +387,12 @@ async def main():
             llm_profiles={"default": chat_config, "embedding": embed_config},
             database_config=db_config,
             memorize_config=memorize_config,
+        )
+        embed_client = service._get_llm_client("embedding")
+        manager = HybridDatabaseManager(
+            config=MemUConfig(),
+            db_config=db_config,
+            user_model=AgentScopeModel,
         )
 
         extra_paths = get_extra_paths()
@@ -336,23 +421,55 @@ async def main():
 
         for file_path in files_to_ingest:
             try:
-                if _resource_exists(file_path, user_id=user_id):
+                content_hash = _calculate_content_hash(file_path)
+                mtime = float(os.path.getmtime(file_path))
+                exists, legacy_doc_ids, stale_doc_ids = _shared_document_exists(
+                    manager,
+                    filename=os.path.basename(file_path),
+                    owner_agent_id=owner_agent,
+                    content_hash=content_hash,
+                    mtime=mtime,
+                )
+
+                if legacy_doc_ids:
+                    _backfill_document_metadata(
+                        manager,
+                        document_ids=legacy_doc_ids,
+                        content_hash=content_hash,
+                        mtime=mtime,
+                    )
                     skipped += 1
                     continue
 
+                if exists:
+                    skipped += 1
+                    continue
+
+                if stale_doc_ids:
+                    _delete_documents_and_chunks(manager, document_ids=stale_doc_ids)
+
                 _log(f"docs_ingest ingest: {file_path}")
-                await asyncio.wait_for(
-                    service.memorize(
-                        resource_url=file_path,
-                        modality="document",
-                        user={"user_id": user_id},
+                result = await asyncio.wait_for(
+                    manager.ingest_document(
+                        file_path=file_path,
+                        agent_id=owner_agent,
+                        user_id=user_id,
+                        embed_client=embed_client,
                     ),
                     timeout=timeout_s,
+                )
+                _persist_document_metadata(
+                    manager,
+                    document_id=result.document_id,
+                    content_hash=content_hash,
+                    mtime=mtime,
                 )
                 ok += 1
             except Exception as e:
                 _log(f"docs_ingest failed: {file_path}: {type(e).__name__}: {e}")
                 fail += 1
+
+        manager.close()
 
         _log(
             f"docs_ingest complete. ok={ok} skipped={skipped} fail={fail} files={len(files_to_ingest)}"

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import html
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
@@ -1317,6 +1318,23 @@ class MemorizeMixin:
             return []
         raw = raw.strip()
 
+        def _sanitize_xml_text(text: str) -> str:
+            return re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z][A-Za-z0-9]+;)", "&amp;", text)
+
+        def _try_parse(xml_text: str) -> list[dict[str, Any]] | None:
+            try:
+                root = ET.fromstring(xml_text)
+            except ET.ParseError:
+                return None
+
+            parsed_items: list[dict[str, Any]] = []
+            for memory_elem in root.findall("memory"):
+                parsed = self._parse_memory_element(memory_elem)
+                if parsed:
+                    parsed["content"] = html.unescape(parsed["content"])
+                    parsed_items.append(parsed)
+            return parsed_items
+
         try:
             boundaries = self._find_xml_boundaries(raw)
             if boundaries is None:
@@ -1325,18 +1343,35 @@ class MemorizeMixin:
 
             start_idx, end_idx, end_tag = boundaries
             xml_content = raw[start_idx : end_idx + len(end_tag)]
-            xml_content = xml_content.replace("&", "&amp;")
+            parsed_direct = _try_parse(xml_content)
+            if parsed_direct is not None:
+                return parsed_direct
 
-            root = ET.fromstring(xml_content)
-            result: list[dict[str, Any]] = []
+            parsed_sanitized = _try_parse(_sanitize_xml_text(xml_content))
+            if parsed_sanitized is not None:
+                return parsed_sanitized
 
-            for memory_elem in root.findall("memory"):
-                parsed = self._parse_memory_element(memory_elem)
-                if parsed:
-                    result.append(parsed)
+            memory_blocks = re.findall(r"<memory\b[\s\S]*?</memory>", xml_content)
+            if not memory_blocks:
+                logger.warning("Failed to parse XML and no recoverable <memory> blocks found")
+                return []
+
+            recovered: list[dict[str, Any]] = []
+            for block in memory_blocks:
+                recovered_items = _try_parse(f"<root>{_sanitize_xml_text(block)}</root>")
+                if recovered_items:
+                    recovered.extend(recovered_items)
+
+            if recovered:
+                logger.warning(
+                    "Recovered %d memory item(s) from malformed XML response",
+                    len(recovered),
+                )
+                return recovered
+
+            logger.warning("Failed to parse XML; returning empty extraction")
+            return []
 
         except ET.ParseError:
-            logger.exception("Failed to parse XML")
+            logger.warning("Failed to parse XML")
             return []
-        else:
-            return result
