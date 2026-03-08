@@ -180,6 +180,13 @@ def _merge_models(
     base_attrs: dict[str, Any],
 ) -> type[SQLModel]:
     """Merge user scope model with core SQLModel."""
+    if user_model is BaseModel:
+        return type(
+            f"{core_model.__name__}{name_suffix}",
+            (core_model,),
+            base_attrs,
+        )
+    
     overlap = set(user_model.model_fields) & set(core_model.model_fields)
     if overlap:
         msg = f"Scope fields conflict with core model fields: {sorted(overlap)}"

@@ -125,8 +125,7 @@ class SQLiteStore(Database):
 
     def _create_tables(self) -> None:
         """Create SQLite tables if they don't exist."""
-        SQLModel.metadata.create_all(self._sessions.engine)
-        # Also create tables from our custom metadata
+        # Only use custom metadata to avoid duplicate Column assignment
         self._sqla_models.Base.metadata.create_all(self._sessions.engine)
         logger.debug("SQLite tables created/verified")
 

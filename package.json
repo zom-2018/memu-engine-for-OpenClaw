@@ -1,12 +1,13 @@
 {
   "name": "memu-engine",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Atomic memory engine for OpenClaw powered by MemU. Features immutable parts for zero redundant token cost.",
   "main": "index.ts",
   "files": [
     "index.ts",
     "openclaw.plugin.json",
     "python/pyproject.toml",
+    "python/README.md",
     "python/uv.lock",
     "python/watch_sync.py",
     "python/auto_sync.py",
