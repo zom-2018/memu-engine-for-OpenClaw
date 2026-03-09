@@ -11,7 +11,7 @@ from typing import Any
 import pendulum
 from pydantic import BaseModel
 from sqlalchemy import JSON, MetaData, String, Text
-from sqlmodel import Column, DateTime, Field, Index, SQLModel, func
+from sqlmodel import DateTime, Field, Index, SQLModel, func
 
 from memu.database.models import MemoryType
 
@@ -48,13 +48,13 @@ class SQLiteBaseModelMixin(SQLModel):
 class SQLiteResourceModel(SQLiteBaseModelMixin, SQLModel):
     """SQLite resource model."""
 
-    url: str = Field(sa_column=Column(String, nullable=False))
-    modality: str = Field(sa_column=Column(String, nullable=False))
-    local_path: str = Field(sa_column=Column(String, nullable=False))
-    caption: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    url: str = Field(sa_column_kwargs={"nullable": False})
+    modality: str = Field(sa_column_kwargs={"nullable": False})
+    local_path: str = Field(sa_column_kwargs={"nullable": False})
+    caption: str | None = Field(default=None, sa_column_kwargs={"type_": Text, "nullable": True})
     # Store embedding as JSON string since SQLite doesn't have native vector type
     embedding_json: str | None = Field(
-        default=None, sa_column=Column(Text, nullable=True)
+        default=None, sa_column_kwargs={"type_": Text, "nullable": True}
     )
 
     @property
@@ -80,17 +80,17 @@ class SQLiteResourceModel(SQLiteBaseModelMixin, SQLModel):
 class SQLiteMemoryItemModel(SQLiteBaseModelMixin, SQLModel):
     """SQLite memory item model."""
 
-    resource_id: str | None = Field(sa_column=Column(String, nullable=True))
-    memory_type: MemoryType = Field(sa_column=Column(String, nullable=False))
-    summary: str = Field(sa_column=Column(Text, nullable=False))
+    resource_id: str | None = Field(sa_column_kwargs={"nullable": True})
+    memory_type: MemoryType = Field(sa_column_kwargs={"nullable": False})
+    summary: str = Field(sa_column_kwargs={"type_": Text, "nullable": False})
     # Store embedding as JSON string since SQLite doesn't have native vector type
     embedding_json: str | None = Field(
-        default=None, sa_column=Column(Text, nullable=True)
+        default=None, sa_column_kwargs={"type_": Text, "nullable": True}
     )
     happened_at: datetime | None = Field(
-        default=None, sa_column=Column(DateTime, nullable=True)
+        default=None, sa_column_kwargs={"type_": DateTime, "nullable": True}
     )
-    extra: dict[str, Any] = Field(default={}, sa_column=Column(JSON, nullable=True))
+    extra: dict[str, Any] = Field(default={}, sa_column_kwargs={"type_": JSON, "nullable": True})
 
     @property
     def embedding(self) -> list[float] | None:
@@ -115,13 +115,13 @@ class SQLiteMemoryItemModel(SQLiteBaseModelMixin, SQLModel):
 class SQLiteMemoryCategoryModel(SQLiteBaseModelMixin, SQLModel):
     """SQLite memory category model."""
 
-    name: str = Field(sa_column=Column(String, nullable=False, index=True))
-    description: str = Field(sa_column=Column(Text, nullable=False))
+    name: str = Field(sa_column_kwargs={"nullable": False, "index": True})
+    description: str = Field(sa_column_kwargs={"type_": Text, "nullable": False})
     # Store embedding as JSON string since SQLite doesn't have native vector type
     embedding_json: str | None = Field(
-        default=None, sa_column=Column(Text, nullable=True)
+        default=None, sa_column_kwargs={"type_": Text, "nullable": True}
     )
-    summary: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    summary: str | None = Field(default=None, sa_column_kwargs={"type_": Text, "nullable": True})
 
     @property
     def embedding(self) -> list[float] | None:
@@ -146,8 +146,8 @@ class SQLiteMemoryCategoryModel(SQLiteBaseModelMixin, SQLModel):
 class SQLiteCategoryItemModel(SQLiteBaseModelMixin, SQLModel):
     """SQLite category-item relation model."""
 
-    item_id: str = Field(sa_column=Column(String, nullable=False))
-    category_id: str = Field(sa_column=Column(String, nullable=False))
+    item_id: str = Field(sa_column_kwargs={"nullable": False})
+    category_id: str = Field(sa_column_kwargs={"nullable": False})
 
     __table_args__ = (
         Index(
