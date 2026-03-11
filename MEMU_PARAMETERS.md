@@ -227,6 +227,87 @@ Note: debug metadata is still available in tool `details`.
 
 These are supported by plugin runtime logic, even if not strictly listed in `openclaw.plugin.json` schema.
 
+#### `config.network.proxy`
+
+- **Type**: `object`
+- **Optional**: Yes
+- **Default**:
+
+  ```json
+  {
+    "mode": "inherit"
+  }
+  ```
+
+- **Meaning**: controls which proxy environment variables are passed into `uv sync`, the background sync service, and one-shot Python helper scripts.
+
+##### `network.proxy.mode`
+
+- **Type**: `"inherit" | "plugin" | "none"`
+- **Optional**: Yes
+- **Default**: `"inherit"`
+- **Meaning**:
+  - `inherit`: keep the host/OpenClaw proxy env as-is (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, including lowercase variants)
+  - `plugin`: ignore host proxy env and use only the explicit proxy fields below
+  - `none`: clear standard proxy env vars before launching Python/uv child processes
+
+In `plugin` mode, memu-engine injects both uppercase and lowercase proxy env names (for example `HTTP_PROXY` and `http_proxy`) for better compatibility across Python/network tooling. If `plugin` mode is selected without any proxy values, runtime logs a warning because the effective behavior becomes “launch without proxy env”.
+
+##### `network.proxy.httpProxy`
+
+- **Type**: `string`
+- **Optional**: Yes
+- **Used when**: `network.proxy.mode = "plugin"`
+- **Meaning**: value injected as `HTTP_PROXY`
+
+##### `network.proxy.httpsProxy`
+
+- **Type**: `string`
+- **Optional**: Yes
+- **Used when**: `network.proxy.mode = "plugin"`
+- **Meaning**: value injected as `HTTPS_PROXY`
+
+##### `network.proxy.allProxy`
+
+- **Type**: `string`
+- **Optional**: Yes
+- **Used when**: `network.proxy.mode = "plugin"`
+- **Meaning**: value injected as `ALL_PROXY`; use this for SOCKS proxy URLs such as `socks5://127.0.0.1:7891`
+
+##### `network.proxy.noProxy`
+
+- **Type**: `string`
+- **Optional**: Yes
+- **Used when**: `network.proxy.mode = "plugin"`
+- **Meaning**: value injected as `NO_PROXY`
+
+Example:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memu-engine": {
+        "enabled": true,
+        "config": {
+          "network": {
+            "proxy": {
+              "mode": "plugin",
+              "httpProxy": "http://127.0.0.1:7890",
+              "httpsProxy": "http://127.0.0.1:7890",
+              "allProxy": "socks5://127.0.0.1:7891",
+              "noProxy": "127.0.0.1,localhost"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+> Design note: `mode="plugin"` is the safest choice when you want deterministic plugin behavior regardless of shell/global proxy env. `mode="none"` is useful when OpenClaw itself runs behind a proxy but you do not want memu-engine child processes to inherit it.
+
 #### `config.userId`
 
 - **Type**: `string`

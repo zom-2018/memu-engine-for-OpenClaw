@@ -85,6 +85,40 @@
         "type": "string",
         "description": "Hybrid memory root directory. Default: ~/.openclaw/memUdata/memory"
       },
+      "network": {
+        "type": "object",
+        "properties": {
+          "proxy": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["inherit", "plugin", "none"],
+                "default": "inherit",
+                "description": "Proxy policy for Python child processes and uv bootstrap. inherit: keep host proxy env; plugin: use only the proxy values configured below; none: clear standard proxy env vars. In plugin mode, memu-engine injects both uppercase and lowercase proxy env names for compatibility."
+              },
+              "httpProxy": {
+                "type": "string",
+                "description": "HTTP proxy URL used when network.proxy.mode=plugin. Example: http://127.0.0.1:7890"
+              },
+              "httpsProxy": {
+                "type": "string",
+                "description": "HTTPS proxy URL used when network.proxy.mode=plugin. Example: http://127.0.0.1:7890"
+              },
+              "allProxy": {
+                "type": "string",
+                "description": "ALL_PROXY value used when network.proxy.mode=plugin. Supports SOCKS proxies such as socks5://127.0.0.1:7891"
+              },
+              "noProxy": {
+                "type": "string",
+                "description": "NO_PROXY value used when network.proxy.mode=plugin. Comma-separated host patterns to bypass proxy."
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
       "agentSettings": {
         "type": "object",
         "additionalProperties": {
