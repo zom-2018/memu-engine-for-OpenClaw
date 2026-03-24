@@ -186,11 +186,11 @@ def _get_agent_session_files(
             return {}
         return {
             str(agent): [str(path) for path in paths if isinstance(path, str) and path]
-            for agent, path in discovered.items()
+            for agent, paths in discovered.items()
             if isinstance(agent, str)
             and agent in enabled
-            and isinstance(path, list)
-            and path
+            and isinstance(paths, list)
+            and paths
         }
     except Exception:
         return {}
