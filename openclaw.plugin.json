@@ -1,20 +1,116 @@
 {
   "id": "memu-engine",
   "name": "memU Agentic Engine",
+  "version": "0.4.1",
   "description": "memU agentic memory layer (SQLModel + Vector)",
   "kind": "memory",
+  "contracts": {
+    "tools": ["memu_search", "memory_search", "memu_get", "memory_get", "memory_flush", "memu_flush"]
+  },
   "configSchema": {
     "type": "object",
+    "additionalProperties": false,
     "properties": {
-      "embedding": { "type": "object" },
-      "extraction": { "type": "object" },
+      "embedding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "default": "openai",
+            "description": "Embedding provider used by the search pipeline."
+          },
+          "baseUrl": {
+            "type": "string",
+            "default": "https://api.openai.com/v1",
+            "description": "Base URL for the embedding provider."
+          },
+          "apiKey": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": ["env", "file", "exec"]
+                  },
+                  "provider": { "type": "string" },
+                  "id": { "type": "string" }
+                },
+                "required": ["source", "provider", "id"]
+              }
+            ],
+            "description": "Embedding API key. Use ${VAR} or a SecretRef object; env-backed SecretRef is the most reliable option."
+          },
+          "model": {
+            "type": "string",
+            "default": "text-embedding-3-small",
+            "description": "Embedding model name."
+          }
+        }
+      },
+      "extraction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "default": "openai",
+            "description": "LLM provider used for extraction, preprocessing, and summary updates."
+          },
+          "baseUrl": {
+            "type": "string",
+            "default": "https://api.openai.com/v1",
+            "description": "Base URL for the extraction provider."
+          },
+          "apiKey": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": ["env", "file", "exec"]
+                  },
+                  "provider": { "type": "string" },
+                  "id": { "type": "string" }
+                },
+                "required": ["source", "provider", "id"]
+              }
+            ],
+            "description": "Extraction API key. Use ${VAR} or a SecretRef object; env-backed SecretRef is the safest path."
+          },
+          "model": {
+            "type": "string",
+            "default": "gpt-4o-mini",
+            "description": "Extraction / summarization model name."
+          }
+        }
+      },
       "language": {
         "type": "string",
         "default": "auto",
         "description": "Output language for memory summaries. Options: 'auto' (follow input), 'zh' (Chinese), 'en' (English), or any language name."
       },
+      "dataDir": {
+        "type": "string",
+        "description": "Override the runtime data directory. Default: ~/.openclaw/memUdata"
+      },
+      "userId": {
+        "type": "string",
+        "description": "User namespace for memory isolation. Default: default"
+      },
+      "memoryRoot": {
+        "type": "string",
+        "description": "Hybrid memory root directory. Default: ~/.openclaw/memUdata/memory"
+      },
       "ingest": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "includeDefaultPaths": {
             "type": "boolean",
@@ -30,7 +126,7 @@
           "filterScheduledSystemMessages": {
             "type": "boolean",
             "default": true,
-            "description": "Filter large system-injected scheduled payloads (e.g., cron-delivered reports) before conversion to memU conversations."
+            "description": "Filter large system-injected scheduled payloads (e.g. cron-delivered reports) before conversion to memU conversations."
           },
           "scheduledSystemMode": {
             "type": "string",
@@ -44,11 +140,11 @@
             "default": 500,
             "description": "Minimum message length to classify a system envelope as a scheduled payload candidate."
           }
-        },
-        "additionalProperties": true
+        }
       },
       "retrieval": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "mode": {
             "type": "string",
@@ -78,18 +174,15 @@
             "default": "compact",
             "description": "Tool output mode for memory_search. compact: returns minimal fields for model context. full: returns full JSON envelope including scores/model metadata."
           }
-        },
-        "additionalProperties": true
-      },
-      "memoryRoot": {
-        "type": "string",
-        "description": "Hybrid memory root directory. Default: ~/.openclaw/memUdata/memory"
+        }
       },
       "network": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "proxy": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
               "mode": {
                 "type": "string",
@@ -113,16 +206,66 @@
                 "type": "string",
                 "description": "NO_PROXY value used when network.proxy.mode=plugin. Comma-separated host patterns to bypass proxy."
               }
-            },
-            "additionalProperties": true
+            }
           }
-        },
-        "additionalProperties": true
+        }
+      },
+      "flushOnCompaction": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, register the compaction hook that flushes staged memory on after_compaction."
+      },
+      "debugTiming": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, enable extra timing output for the search helper CLI."
+      },
+      "chunkSize": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2048,
+        "default": 512,
+        "description": "Document chunk size used during ingestion. Deprecated-but-supported compatibility key retained for upgrade safety."
+      },
+      "chunkOverlap": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 50,
+        "description": "Document chunk overlap used during ingestion. Deprecated-but-supported compatibility key retained for upgrade safety; must remain smaller than chunkSize at runtime."
+      },
+      "flushIdleSeconds": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Legacy compatibility key from older memu-engine releases. Accepted to avoid upgrade breakage, but ignored by the current runtime."
+      },
+      "maxMessagesPerPart": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Legacy compatibility key from older memu-engine releases. Accepted to avoid upgrade breakage, but ignored by the current runtime."
+      },
+      "enabledAgents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["main"],
+        "description": "Legacy compatibility list of agent names participating in ingestion and retrieval."
+      },
+      "allowCrossAgentRetrieval": {
+        "type": "boolean",
+        "description": "Deprecated compatibility flag. Prefer agentSettings.<agent>.searchableStores instead."
+      },
+      "storageMode": {
+        "type": "string",
+        "enum": ["hybrid"],
+        "default": "hybrid",
+        "description": "Deprecated compatibility flag. memu-engine always runs in hybrid mode."
       },
       "agentSettings": {
         "type": "object",
+        "default": {},
+        "description": "Per-agent memory policy settings.",
         "additionalProperties": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "memoryEnabled": {
               "type": "boolean",
@@ -141,9 +284,7 @@
               "description": "Search targets: self, shared, or explicit agent names."
             }
           }
-        },
-        "default": {},
-        "description": "Per-agent memory policy settings."
+        }
       }
     }
   }

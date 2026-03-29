@@ -7,9 +7,9 @@ sync from upstream with minimal friction.
 ## Upstream
 
 - Upstream repository: https://github.com/NevaMind-AI/MemU
-- Upstream version/tag: `v1.4.0`
-- Upstream commit (best-effort snapshot): `777f1eda1c5a4a3252ffe94f0b98c9c75c6d4539`
-- Date imported: 2026-02-07
+- Upstream version/tag: `v1.5.1`
+- Upstream commit (best-effort snapshot): `357aefc8012705bfde723f141d52f675fe712bed`
+- Date imported: 2026-03-29
 
 ## What We Vendor
 
@@ -31,54 +31,56 @@ These files are specific to OpenClaw and do not exist upstream:
 - `python/scripts/search.py`: CLI entrypoint used by the Node plugin for retrieval.
 - `python/scripts/get.py`: CLI entrypoint used by the Node plugin for reading a resource.
 
-## Upstream Patches (Modified Files)
+## Upstream Delta Ledger
 
-These are changes made to the vendored MemU core to better fit OpenClaw and long-running ingestion.
+These are the local changes that intentionally diverge from vanilla upstream and must be preserved or
+revalidated on every sync.
 
-1) Avoid timeouts during conversation segmentation
+1) OpenClaw ingestion and sync overlay
 
-- File: `python/src/memu/app/memorize.py`
-- Change:
-  - Filter out empty prompts and keep memory_type alignment correct.
-  - Avoid per-segment LLM summarization in `_split_conversation_into_resources` (keep captions only if
-    the preprocessor already provided them).
-- Reason: per-segment summarization can be very slow and can cause ingest timeouts.
+- Files: `python/watch_sync.py`, `python/auto_sync.py`, `python/convert_sessions.py`, `python/docs_ingest.py`
+- Purpose:
+  - translate OpenClaw session logs and workspace docs into MemU resources
+  - keep background sync and one-shot sync behavior inside the plugin
+  - preserve OpenClaw-specific session and workspace semantics
 
-2) Scope model merging (Pydantic)
+2) Plugin CLI bridge
 
-- File: `python/src/memu/database/models.py`
-- Change: build scoped models with `pydantic.create_model(__base__=...)` instead of multiple inheritance.
-- Reason: multiple inheritance between two Pydantic models can trigger MRO inconsistencies (and can confuse
-  static checkers). The behavior (a model that contains both scope fields and core fields) stays the same.
+- Files: `python/scripts/search.py`, `python/scripts/get.py`, `python/scripts/flush.py`
+- Purpose:
+  - provide the Node plugin tool entrypoints for `memory_search`, `memory_get`, and `memory_flush`
+  - keep the plugin self-contained and callable from OpenClaw without importing upstream CLI internals
 
-3) SQLite compatibility + runtime stability
+3) Data layout and migration compatibility
 
-- File: `python/src/memu/database/sqlite/session.py`
-- Change:
-  - Preflight DB path creation/touch.
-  - Use `NullPool`, set SQLite pragmas (WAL, busy_timeout, foreign_keys).
-- Reason: reduces intermittent "unable to open database file" and lock-related failures.
+- Files: `python/scripts/migrate_storage_layout.py`, `python/scripts/migrate_agent_id.py`, `python/src/memu/migration/*`
+- Purpose:
+  - preserve the OpenClaw-specific storage layout and migration path
+  - maintain backward compatibility with older per-agent and legacy single-db layouts
 
-Note:
+4) SQLite and model compatibility patches
 
-- Upstream uses table names like `sqlite_*`. On SQLite, names starting with `sqlite_` are reserved for
-  internal use and cannot be created. This plugin uses `memu_*` table names instead.
-- If you previously ran a build that used a different table naming scheme, delete the existing
-  `memu.db` and let it rebuild.
+- Files: `python/src/memu/database/models.py`, `python/src/memu/database/sqlite/session.py`, `python/src/memu/database/sqlite/models.py`
+- Purpose:
+  - keep scoped model creation stable under Pydantic 2 / Python 3.13
+  - keep SQLite connection handling resilient in plugin environments
+  - preserve the `embedding_json` storage workaround for SQLite table models
 
-4) SQLModel mapping workaround (embedding fields)
-
-- File: `python/src/memu/database/sqlite/models.py`
-- Change: SQLite SQLModel table models do not inherit from the domain Pydantic models.
-- Reason: the domain models include `embedding: list[float] | None`, which SQLModel may try to map to a
-  column and fail with "no matching SQLAlchemy type". The SQLite models store embeddings as
-  `embedding_json` and expose `embedding` as a property.
-
-4) Default OpenAI client timeout
+5) Runtime safety patching
 
 - File: `python/src/memu/llm/openai_sdk.py`
-- Change: set a default request timeout (`timeout=120`).
-- Reason: avoid hangs during ingestion when a provider stalls.
+- Purpose:
+  - keep a sane default timeout for stalled provider calls
+
+## Sync Policy
+
+We sync only upstream-owned runtime code and metadata, then reapply the local overlay above.
+
+- Upstream-owned paths: `python/src/memu/**`, `python/pyproject.toml`, `python/uv.lock`
+- Local overlay paths: all OpenClaw-specific scripts, plugin entrypoint, manifest, docs, and vendored patches
+
+When reviewing a sync, prefer explicit patch files or patch sections over inline shell edits. If a patch no
+longer applies cleanly, stop and reconcile the divergence instead of forcing a partial update.
 
 ## How to Sync From Upstream
 
@@ -88,11 +90,10 @@ There is a helper script at the plugin root:
 
 Notes:
 
-- It copies upstream `src/` into `python/src/`.
-- It keeps OpenClaw-specific scripts.
-- It applies a best-effort patch for one of the SQLite/Pydantic issues.
-- It may overwrite `python/pyproject.toml` with upstream's maturin-based config. If you rely on the
-  simplified packaging in this plugin, re-check `python/pyproject.toml` after syncing.
+- It copies upstream `src/` into `python/src/` only for upstream-owned files.
+- It keeps OpenClaw-specific scripts and plugin glue untouched.
+- It reapplies the local overlay in a controlled, fail-fast order.
+- It must not rewrite the plugin's packaging strategy into upstream's maturin install path.
 
 After syncing:
 
