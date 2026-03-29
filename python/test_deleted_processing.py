@@ -13,15 +13,23 @@ TEST_DIR = tempfile.mkdtemp(prefix="memu_test_")
 SESSIONS_DIR = os.path.join(TEST_DIR, "sessions")
 DATA_DIR = os.path.join(TEST_DIR, "data")
 CONV_DIR = os.path.join(DATA_DIR, "conversations")
+CONV_DIR_MAIN = os.path.join(CONV_DIR, "main")
 
 os.makedirs(SESSIONS_DIR)
-os.makedirs(CONV_DIR)
+os.makedirs(CONV_DIR_MAIN)
 
 os.environ["OPENCLAW_SESSIONS_DIR"] = SESSIONS_DIR
 os.environ["MEMU_DATA_DIR"] = DATA_DIR
 
 # 现在导入模块
-from convert_sessions import convert, _extract_session_id, _load_state, _save_state, SESSION_FILENAME_RE
+from convert_sessions import (
+    SESSION_FILENAME_RE,
+    _extract_session_id,
+    _load_state,
+    _save_state,
+    _state_path,
+    convert,
+)
 
 
 def create_openclaw_jsonl(file_path: str, messages: list[tuple[str, str]]) -> None:
@@ -92,7 +100,7 @@ def test_deleted_file_without_state():
     result = convert(since_ts=None)
     
     # 验证
-    expected_part = os.path.join(CONV_DIR, f"{session_id}.part000.json")
+    expected_part = os.path.join(CONV_DIR_MAIN, f"{session_id}.part000.json")
     if expected_part in result:
         print(f"  ✅ 生成了分片: {os.path.basename(expected_part)}")
         
@@ -116,14 +124,16 @@ def test_deleted_file_with_existing_parts():
     session_id = "b2c3d4e5-f6a7-8901-bcde-f23456789012"
     
     # 模拟已有 3 个分片
-    state = _load_state()
+    current_state_path = _state_path("main")
+    state = _load_state(state_path=current_state_path)
+    state["version"] = 4
     state["sessions"] = state.get("sessions", {})
     state["sessions"][session_id] = {
         "file_path": f"/fake/path/{session_id}.jsonl",
         "last_offset": 50,   # 假装已经读了 50 字节（只读了 header）
         "part_count": 3,     # 已有 3 个分片 (part000, part001, part002)
     }
-    _save_state(state)
+    _save_state(state, state_path=current_state_path)
     
     # 创建对应的 .deleted 文件
     deleted_filename = f"{session_id}.jsonl.deleted.2026-02-09T11-00-00.000Z"
@@ -140,8 +150,8 @@ def test_deleted_file_with_existing_parts():
     result = convert(since_ts=None)
     
     # 验证: 新分片应该是 part003，而不是 part000
-    expected_part = os.path.join(CONV_DIR, f"{session_id}.part003.json")
-    wrong_part = os.path.join(CONV_DIR, f"{session_id}.part000.json")
+    expected_part = os.path.join(CONV_DIR_MAIN, f"{session_id}.part003.json")
+    wrong_part = os.path.join(CONV_DIR_MAIN, f"{session_id}.part000.json")
     
     has_expected = expected_part in result
     has_wrong = wrong_part in result

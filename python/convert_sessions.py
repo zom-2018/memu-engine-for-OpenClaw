@@ -366,6 +366,32 @@ def _get_agent_session_ids(sessions_dir: str, agent_name: str) -> list[str]:
     return out
 
 
+def _discover_deleted_main_session_files(agent_name: str) -> list[str]:
+    """Fallback discovery for archived main-session transcripts.
+
+    When session indexes are unavailable, retain support for `.jsonl.deleted.*`
+    archives that correspond to UUID-shaped main sessions. This preserves the
+    older recovery flow without reintroducing arbitrary sub-session ingestion.
+    """
+
+    roots = [os.path.join(sessions_dir, agent_name), sessions_dir]
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for root in roots:
+        for path in glob.glob(os.path.join(root, DELETED_GLOB)):
+            session_id = _extract_session_id(os.path.basename(path))
+            if not session_id or not _is_main_session(session_id):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            candidates.append(path)
+
+    candidates.sort(key=lambda p: _extract_deleted_timestamp(os.path.basename(p)))
+    return candidates
+
+
 def _get_main_session_id(agent_name: str = "main") -> str | None:
     session_ids = _get_agent_session_ids(sessions_dir, agent_name)
     return session_ids[0] if session_ids else None
@@ -400,8 +426,12 @@ def _resolve_session_file(session_id: str, agent_name: str | None = None) -> str
         candidates.extend(
             glob.glob(os.path.join(sessions_dir, agent_name, f"{session_id}.jsonl.bak*"))
         )
+        candidates.extend(
+            glob.glob(os.path.join(sessions_dir, agent_name, f"{session_id}.jsonl.deleted.*"))
+        )
     candidates.extend(glob.glob(os.path.join(sessions_dir, f"{session_id}.jsonl.reset.*")))
     candidates.extend(glob.glob(os.path.join(sessions_dir, f"{session_id}.jsonl.bak*")))
+    candidates.extend(glob.glob(os.path.join(sessions_dir, f"{session_id}.jsonl.deleted.*")))
     if not candidates:
         return None
 
@@ -805,6 +835,8 @@ def convert(
         discovered = discover_all_session_files(sessions_dir, [resolved_agent])
         session_files = discovered.get(resolved_agent, [])
         if not session_files:
+            session_files = _discover_deleted_main_session_files(resolved_agent)
+        if not session_files:
             print(
                 f"[convert_sessions] No session found in sessions indexes for agent: {resolved_agent}",
                 file=__import__("sys").stderr,
@@ -820,12 +852,17 @@ def convert(
             )
             if not target_session_id:
                 continue
+            should_force_flush = force_flush or (
+                ".jsonl.deleted." in session_file
+                or ".jsonl.reset." in session_file
+                or ".jsonl.bak" in session_file
+            )
             converted_paths = convert(
                 since_ts=since_ts,
                 session_id=target_session_id,
                 agent_name=resolved_agent,
                 memory_root=resolved_memory_root,
-                force_flush=force_flush,
+                force_flush=should_force_flush,
             )
             for path in converted_paths:
                 if path in seen_paths:
@@ -848,6 +885,12 @@ def convert(
                 file=__import__("sys").stderr,
             )
             return []
+        if (
+            ".jsonl.deleted." in session_file
+            or ".jsonl.reset." in session_file
+            or ".jsonl.bak" in session_file
+        ):
+            force_flush = True
 
     state = _load_state(state_path=state_path, legacy_state_path=legacy_state_path)
     sessions_state: dict[str, Any] = state.setdefault("sessions", {})
@@ -856,6 +899,11 @@ def convert(
 
     file_path = session_file
     session_id = target_session_id
+    is_archived_transcript = (
+        ".jsonl.deleted." in file_path
+        or ".jsonl.reset." in file_path
+        or ".jsonl.bak" in file_path
+    )
 
     try:
         st = os.stat(file_path)
@@ -911,26 +959,29 @@ def convert(
             return converted
 
     append_only = True
-    if prev and (prev_dev is not None and prev_ino is not None):
-        if int(prev_dev) != cur_dev or int(prev_ino) != cur_ino:
+    if is_archived_transcript and prev:
+        append_only = cur_size >= prev_offset and prev_lang == lang_prefix
+    else:
+        if prev and (prev_dev is not None and prev_ino is not None):
+            if int(prev_dev) != cur_dev or int(prev_ino) != cur_ino:
+                append_only = False
+        if cur_size < prev_offset:
             append_only = False
-    if cur_size < prev_offset:
-        append_only = False
-    if prev_lang != lang_prefix:
-        append_only = False
+        if prev_lang != lang_prefix:
+            append_only = False
 
-    if append_only and prev_offset > 0 and (prev_head_sha or prev_tail_sha):
-        head_len = min(SAMPLE_BYTES, cur_size)
-        head_sha = _sha256_file_sample(file_path=file_path, start=0, length=head_len)
-        tail_start = max(0, prev_offset - SAMPLE_BYTES)
-        tail_len = max(0, min(SAMPLE_BYTES, prev_offset - tail_start))
-        tail_sha = _sha256_file_sample(
-            file_path=file_path, start=tail_start, length=tail_len
-        )
-        if (prev_head_sha and head_sha != prev_head_sha) or (
-            prev_tail_sha and tail_sha != prev_tail_sha
-        ):
-            append_only = False
+        if append_only and prev_offset > 0 and (prev_head_sha or prev_tail_sha):
+            head_len = min(SAMPLE_BYTES, cur_size)
+            head_sha = _sha256_file_sample(file_path=file_path, start=0, length=head_len)
+            tail_start = max(0, prev_offset - SAMPLE_BYTES)
+            tail_len = max(0, min(SAMPLE_BYTES, prev_offset - tail_start))
+            tail_sha = _sha256_file_sample(
+                file_path=file_path, start=tail_start, length=tail_len
+            )
+            if (prev_head_sha and head_sha != prev_head_sha) or (
+                prev_tail_sha and tail_sha != prev_tail_sha
+            ):
+                append_only = False
 
     def _load_tail_messages() -> list[dict[str, str]]:
         candidates = [

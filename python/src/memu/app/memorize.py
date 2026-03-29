@@ -1348,11 +1348,10 @@ class MemorizeMixin:
             raw = _normalize_xml_response(raw)
             boundaries = self._find_xml_boundaries(raw)
             if boundaries is None:
-                logger.warning("Could not find valid root tag in XML response")
-                return []
-
-            start_idx, end_idx, end_tag = boundaries
-            xml_content = raw[start_idx : end_idx + len(end_tag)]
+                xml_content = raw
+            else:
+                start_idx, end_idx, end_tag = boundaries
+                xml_content = raw[start_idx : end_idx + len(end_tag)]
             parsed_direct = _try_parse(xml_content)
             if parsed_direct is not None:
                 return parsed_direct
