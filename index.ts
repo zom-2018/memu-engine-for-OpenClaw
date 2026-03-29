@@ -1,4 +1,4 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { definePluginEntry, type OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -299,7 +299,6 @@ function isSecretRef(value: unknown): value is SecretRef {
 // ============================================================================
 
 // Track warnings to avoid duplicate messages (only warn once per session)
-const warnedPlaintextKeys = new Set<string>();
 const warnedSecretRefFailures = new Set<string>();
 
 // Regex to match OpenClaw's env template syntax: ${VAR_NAME}
@@ -336,7 +335,11 @@ function parseEnvTemplateSecretRef(value: unknown): SecretRef | null {
 async function resolveMaybeSecretString(
   input: SecretInput | undefined,
   context: { keyName: string; envFallback?: string }
-): Promise<{ value: string; source: "plaintext" | "secretref" | "env-template" | "env-fallback" } | undefined> {
+): Promise<{
+  value: string;
+  source: "plaintext" | "secretref" | "env-template" | "env-fallback" | "runtime-env";
+  matchedEnvVarName?: string;
+} | undefined> {
   if (!input) {
     return undefined;
   }
@@ -366,6 +369,15 @@ async function resolveMaybeSecretString(
       return undefined;
     }
     
+    const matchedEnvVarName = findMatchingEnvVarName(input);
+    if (matchedEnvVarName) {
+      return {
+        value: input,
+        source: "runtime-env",
+        matchedEnvVarName,
+      };
+    }
+
     // Not an env template, treat as plain string
     return { value: input, source: "plaintext" };
   }
@@ -416,6 +428,21 @@ async function resolveSecretRef(ref: SecretRef): Promise<string | undefined> {
   );
 }
 
+function findMatchingEnvVarName(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  for (const [envName, envValue] of Object.entries(process.env)) {
+    if (typeof envValue !== "string") continue;
+    if (!envValue) continue;
+    if (envValue === trimmed) {
+      return envName;
+    }
+  }
+
+  return undefined;
+}
+
 /**
  * Resolve API key with fallback priority:
  * 1. Config value (SecretRef or plaintext)
@@ -434,21 +461,9 @@ async function resolveApiKeyWithFallback(
   });
 
   if (resolved) {
-    // Warn about plaintext API keys (only once per key pattern)
-    // Don't warn for env-template or secretref (those are secure)
-    if (resolved.source === "plaintext" && resolved.value) {
-      const keyPattern = resolved.value.substring(0, 8); // First 8 chars for deduplication
-      if (!warnedPlaintextKeys.has(keyPattern)) {
-        console.warn(
-          `[memu-engine] Plaintext API key detected for ${keyName}. ` +
-          `Consider using SecretRef for better security. ` +
-          `Examples:\n` +
-          `  - Simplified syntax: "\${${envVarName}}"\n` +
-          `  - Full SecretRef: {"source": "env", "provider": "default", "id": "${envVarName}"}`
-        );
-        warnedPlaintextKeys.add(keyPattern);
-      }
-    }
+    // Do not warn on direct string values here. By the time plugin config reaches the
+    // runtime, OpenClaw may already have resolved env-template/SecretRef values into
+    // ordinary strings, so warning here would produce false positives.
     return resolved.value;
   }
 
@@ -470,14 +485,120 @@ type PythonBootstrapResult = {
   reason?: string;
 };
 
-const memuEnginePlugin = {
+type MemorySearchResult = {
+  path: string;
+  startLine: number;
+  endLine: number;
+  score: number;
+  snippet: string;
+  source: "memory" | "sessions";
+  citation?: string;
+};
+
+type MemoryEmbeddingProbeResult = {
+  ok: boolean;
+  error?: string;
+};
+
+type MemoryProviderStatus = {
+  backend: "builtin" | "qmd";
+  provider: string;
+  model?: string;
+  requestedProvider?: string;
+  workspaceDir?: string;
+  dbPath?: string;
+  extraPaths?: string[];
+  sources?: Array<"memory" | "sessions">;
+  custom?: Record<string, unknown>;
+};
+
+type MemorySyncProgressUpdate = {
+  completed: number;
+  total: number;
+  label?: string;
+};
+
+type RegisteredMemorySearchManager = {
+  search(
+    query: string,
+    opts?: { maxResults?: number; minScore?: number; sessionKey?: string }
+  ): Promise<MemorySearchResult[]>;
+  readFile(params: { relPath: string; from?: number; lines?: number }): Promise<{ text: string; path: string }>;
+  status(): MemoryProviderStatus;
+  sync?(params?: {
+    reason?: string;
+    force?: boolean;
+    sessionFiles?: string[];
+    progress?: (update: MemorySyncProgressUpdate) => void;
+  }): Promise<void>;
+  probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>;
+  probeVectorAvailability(): Promise<boolean>;
+  close?(): Promise<void>;
+};
+
+const memuEnginePlugin = definePluginEntry({
   id: "memu-engine",
   name: "memU Agentic Engine",
+  description: "memU agentic memory layer (SQLModel + Vector)",
   kind: "memory",
 
   register(api: OpenClawPluginApi) {
-    const pythonRoot = path.join(__dirname, "python");
+    const apiAny = api as any;
+    const logger = apiAny.logger || console;
+    const logInfo = (message: string): void => {
+      if (typeof (logger as { info?: unknown }).info === "function") {
+        (logger as { info: (msg: string) => void }).info(message);
+        return;
+      }
+      if (typeof (logger as { log?: unknown }).log === "function") {
+        (logger as { log: (msg: string) => void }).log(message);
+        return;
+      }
+      console.log(message);
+    };
+    const resolvePythonRoot = (): string => {
+      const candidates = [
+        typeof apiAny.resolvePath === "function" ? apiAny.resolvePath("python") : undefined,
+        path.join(__dirname, "python"),
+        path.join(os.homedir(), ".openclaw", "extensions", "memu-engine", "python"),
+      ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+
+      for (const candidate of candidates) {
+        try {
+          if (fs.existsSync(candidate) && fs.existsSync(path.join(candidate, "pyproject.toml"))) {
+            return candidate;
+          }
+        } catch {
+          // try next candidate
+        }
+      }
+
+      return candidates[0] ?? path.join(os.homedir(), ".openclaw", "extensions", "memu-engine", "python");
+    };
+    const pythonRoot = resolvePythonRoot();
+    const resolveUvBinary = (): string => {
+      const candidates = [
+        process.env.MEMU_UV_BIN,
+        process.env.UV_BIN,
+        path.join(os.homedir(), ".local", "bin", "uv"),
+        "uv",
+      ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+
+      for (const candidate of candidates) {
+        if (candidate === "uv") return candidate;
+        try {
+          fs.accessSync(candidate, fs.constants.X_OK);
+          return candidate;
+        } catch {
+          // try next candidate
+        }
+      }
+
+      return "uv";
+    };
+    const uvBinary = resolveUvBinary();
     let pythonBootstrapResult: PythonBootstrapResult | null = null;
+    const memoryManagerCache = new Map<string, RegisteredMemorySearchManager>();
 
     const ensurePythonRuntime = (pluginConfig?: any): PythonBootstrapResult => {
       if (pythonBootstrapResult) return pythonBootstrapResult;
@@ -485,12 +606,13 @@ const memuEnginePlugin = {
       const normalizedConfig = normalizeConfig(pluginConfig || api.pluginConfig || {});
 
       try {
-        execFileSync("uv", ["--version"], { stdio: "ignore" });
+        execFileSync(uvBinary, ["--version"], { stdio: "ignore" });
       } catch {
         pythonBootstrapResult = {
           ok: false,
           reason:
-            "`uv` is required but not found in PATH. Install uv first: https://docs.astral.sh/uv/",
+            `\`uv\` is required but not available (resolved path: ${uvBinary}). ` +
+            "Install uv first or set MEMU_UV_BIN to the absolute binary path: https://docs.astral.sh/uv/",
         };
         return pythonBootstrapResult;
       }
@@ -498,7 +620,7 @@ const memuEnginePlugin = {
       try {
         // Ensure an isolated runtime and dependency set for this plugin.
         // This avoids relying on system python (often 3.10) and prevents ABI mismatches.
-        execFileSync("uv", ["sync", "--project", pythonRoot, "--frozen"], {
+        execFileSync(uvBinary, ["sync", "--project", pythonRoot, "--frozen"], {
           cwd: pythonRoot,
           env: buildPythonProcessEnv(normalizedConfig, {
             UV_LINK_MODE: process.env.UV_LINK_MODE || "copy",
@@ -506,16 +628,16 @@ const memuEnginePlugin = {
           stdio: "ignore",
         });
 
-        // Validate runtime compatibility up front (MemU requires Python >= 3.11).
+        // Validate runtime compatibility up front (MemU requires Python >= 3.13).
         execFileSync(
-          "uv",
+          uvBinary,
           [
             "run",
             "--project",
             pythonRoot,
             "python",
             "-c",
-            "import sys; assert sys.version_info >= (3, 11), sys.version; import memu",
+            "import sys; assert sys.version_info >= (3, 13), sys.version; import memu",
           ],
           {
             cwd: pythonRoot,
@@ -532,7 +654,7 @@ const memuEnginePlugin = {
           ok: false,
           reason:
             "Failed to bootstrap isolated Python runtime via `uv sync --project python --frozen`. " +
-            `Detail: ${msg}`,
+            `pythonRoot=${pythonRoot}. uv=${uvBinary}. Detail: ${msg}`,
         };
         return pythonBootstrapResult;
       }
@@ -570,14 +692,14 @@ const memuEnginePlugin = {
       return out;
     };
 
-    const getPluginConfig = (toolCtx?: { config?: any }) => {
+    const getPluginConfig = (toolCtx?: { config?: any; runtimeConfig?: any }) => {
       // Prefer plugin-scoped config (what users edit under plugins.entries["memu-engine"].config)
       if (api.pluginConfig && typeof api.pluginConfig === "object") {
         return api.pluginConfig as Record<string, unknown>;
       }
 
       // Fallback: derive from full OpenClaw config if present
-      const fullCfg = toolCtx?.config;
+      const fullCfg = toolCtx?.runtimeConfig || toolCtx?.config || apiAny.config;
       const cfgFromFull = fullCfg?.plugins?.entries?.[api.id]?.config;
       if (cfgFromFull && typeof cfgFromFull === "object") {
         return cfgFromFull as Record<string, unknown>;
@@ -610,7 +732,7 @@ const memuEnginePlugin = {
         if (fs.existsSync(sessionDir)) {
           agentDirs.set(agentName, sessionDir);
         } else {
-          console.warn(
+          logger.warn(
             `[memu-engine] Agent '${agentName}' sessions directory does not exist: ${sessionDir}`
           );
         }
@@ -623,15 +745,16 @@ const memuEnginePlugin = {
       return agentDirs;
     };
 
-    const getSessionDir = (): string => {
-      const dirs = getSessionDirs(["main"]);
-      const mainDir = dirs.get("main");
-      if (mainDir && fs.existsSync(mainDir)) {
-        return mainDir;
+    const getSessionDir = (agentName = "main"): string => {
+      const dirs = getSessionDirs([agentName]);
+      const directDir = dirs.get(agentName);
+      if (directDir && fs.existsSync(directDir)) {
+        return directDir;
       }
 
       const home = os.homedir();
       const candidates = [
+        path.join(home, ".openclaw", "agents", agentName, "sessions"),
         path.join(home, ".openclaw", "agents", "main", "sessions"),
         path.join(home, ".openclaw", "sessions"),
       ];
@@ -771,6 +894,264 @@ const memuEnginePlugin = {
       return path.join(process.env.HOME || "", ".openclaw", "memUdata", "memory");
     };
 
+    const resolveWorkspaceDir = (toolCtx?: { workspaceDir?: string; agentId?: string }): string => {
+      const runtimeAgent = apiAny.runtime?.agent;
+      if (runtimeAgent && typeof runtimeAgent.resolveAgentWorkspaceDir === "function") {
+        try {
+          const resolved = runtimeAgent.resolveAgentWorkspaceDir(apiAny.config, toolCtx?.agentId || "main");
+          if (typeof resolved === "string" && resolved.trim()) {
+            return resolved;
+          }
+        } catch {
+          // Fall back to legacy discovery below.
+        }
+      }
+
+      if (toolCtx?.workspaceDir) {
+        return toolCtx.workspaceDir;
+      }
+
+      const home = os.homedir();
+      const workspaceCandidates = [
+        process.env.OPENCLAW_WORKSPACE_DIR,
+        path.join(home, ".openclaw", "workspace"),
+        process.cwd(),
+      ].filter(Boolean) as string[];
+
+      for (const candidate of workspaceCandidates) {
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+      }
+
+      return workspaceCandidates[0] || process.cwd();
+    };
+
+    const resolveAgentId = (toolCtx?: { agentId?: string; sessionKey?: string }): string => {
+      if (typeof toolCtx?.agentId === "string" && toolCtx.agentId.trim()) {
+        return toolCtx.agentId.trim();
+      }
+
+      if (typeof toolCtx?.sessionKey === "string") {
+        const parts = toolCtx.sessionKey.split(":");
+        if (parts.length >= 2 && parts[0] === "agent" && parts[1]?.trim()) {
+          return parts[1].trim();
+        }
+      }
+
+      return "main";
+    };
+
+    const agentDbPath = (pluginConfig: any, agentId: string): string =>
+      path.join(getMemoryRoot(pluginConfig), agentId, "memu.db");
+
+    const buildMemoryPromptSection = ({
+      availableTools,
+      citationsMode,
+    }: {
+      availableTools?: Set<string>;
+      citationsMode?: "on" | "off";
+    } = {}): string[] => {
+      const hasMemorySearch = availableTools?.has("memory_search") ?? true;
+      const hasMemoryGet = availableTools?.has("memory_get") ?? true;
+      if (!hasMemorySearch && !hasMemoryGet) {
+        return [];
+      }
+
+      let toolGuidance = "";
+      if (hasMemorySearch && hasMemoryGet) {
+        toolGuidance =
+          "Before answering about prior work, decisions, dates, preferences, or todos, run memory_search first and then use memory_get only for the lines you actually need.";
+      } else if (hasMemorySearch) {
+        toolGuidance =
+          "Before answering about prior work, decisions, dates, preferences, or todos, run memory_search and answer from the returned memory snippets.";
+      } else {
+        toolGuidance =
+          "When the user already points to a specific memory file, run memory_get to load only the needed lines before answering.";
+      }
+
+      const lines = ["## Memory Recall", toolGuidance];
+      if (citationsMode === "off") {
+        lines.push("Citations are disabled, so do not mention file paths or line numbers unless the user explicitly asks.");
+      } else {
+        lines.push("When it helps the user verify results, include Source references from returned memory snippets.");
+      }
+      lines.push("");
+      return lines;
+    };
+
+    const getMemorySearchManager = (toolCtx?: {
+      config?: any;
+      runtimeConfig?: any;
+      workspaceDir?: string;
+      sessionKey?: string;
+      agentId?: string;
+    }): RegisteredMemorySearchManager => {
+      const pluginConfig = getPluginConfig(toolCtx);
+      const workspaceDir = resolveWorkspaceDir(toolCtx);
+      const agentId = resolveAgentId(toolCtx);
+      const cacheKey = `${workspaceDir}::${agentId}`;
+      const cached = memoryManagerCache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
+      const normalizedConfig = normalizeConfig(pluginConfig);
+      const retrievalCfg = getRetrievalConfig(normalizedConfig);
+      const defaultPolicy = { memoryEnabled: true, searchEnabled: true, searchableStores: ["self"] as string[] };
+      const agentPolicy = normalizedConfig.agentSettings?.[agentId] || defaultPolicy;
+      const resolvedStores = Array.from(
+        new Set(
+          (Array.isArray(agentPolicy.searchableStores) ? agentPolicy.searchableStores : ["self"]).map((store) =>
+            store === "self" ? agentId : store
+          )
+        )
+      );
+
+      const manager: RegisteredMemorySearchManager = {
+        async search(query, opts) {
+          const args: string[] = [query, "--mode", retrievalCfg.mode, "--requesting-agent", agentId];
+          args.push("--search-stores", resolvedStores.join(","));
+
+          if (typeof opts?.maxResults === "number" && Number.isFinite(opts.maxResults)) {
+            args.push("--max-results", String(Math.trunc(opts.maxResults)));
+          }
+          if (typeof opts?.minScore === "number" && Number.isFinite(opts.minScore)) {
+            args.push("--min-score", String(opts.minScore));
+          }
+          if (retrievalCfg.defaultCategoryQuota !== null) {
+            args.push("--category-quota", String(retrievalCfg.defaultCategoryQuota));
+          }
+          if (retrievalCfg.defaultItemQuota !== null) {
+            args.push("--item-quota", String(retrievalCfg.defaultItemQuota));
+          }
+          if (retrievalCfg.mode === "full") {
+            const history = getRecentSessionMessages(getSessionDir(agentId), retrievalCfg.contextMessages);
+            args.push("--queries-json", JSON.stringify([...history, { role: "user", content: query }]));
+          }
+
+          const result = await runPython("search.py", args, normalizedConfig, workspaceDir);
+          const parsed = JSON.parse(result) as { results?: Array<Record<string, unknown>> };
+          return Array.isArray(parsed.results)
+            ? parsed.results.map((row) => {
+                const pathValue = typeof row.path === "string" ? row.path : "";
+                const startLine = Number.isFinite(Number(row.startLine)) ? Math.trunc(Number(row.startLine)) : 1;
+                const endLine = Number.isFinite(Number(row.endLine)) ? Math.trunc(Number(row.endLine)) : startLine;
+                const source = row.source === "sessions" ? "sessions" : "memory";
+                return {
+                  path: pathValue,
+                  startLine,
+                  endLine,
+                  score: Number.isFinite(Number(row.score)) ? Number(row.score) : 0,
+                  snippet: typeof row.snippet === "string" ? row.snippet : "",
+                  source,
+                  citation:
+                    typeof row.citation === "string"
+                      ? row.citation
+                      : pathValue
+                        ? `${pathValue}:${startLine}`
+                        : undefined,
+                };
+              })
+            : [];
+        },
+        async readFile(params) {
+          const args: string[] = [params.relPath];
+          if (typeof params.from === "number" && Number.isFinite(params.from)) {
+            args.push("--from", String(Math.trunc(params.from)));
+          }
+          if (typeof params.lines === "number" && Number.isFinite(params.lines)) {
+            args.push("--lines", String(Math.trunc(params.lines)));
+          }
+          const result = await runPython("get.py", args, normalizedConfig, workspaceDir);
+          const parsed = JSON.parse(result) as { path?: string; text?: string };
+          return {
+            path: typeof parsed.path === "string" ? parsed.path : params.relPath,
+            text: typeof parsed.text === "string" ? parsed.text : "",
+          };
+        },
+        status() {
+          const embeddingConfig = normalizedConfig.embedding || {};
+          return {
+            backend: "builtin",
+            provider: typeof embeddingConfig.provider === "string" ? embeddingConfig.provider : "openai",
+            requestedProvider: typeof embeddingConfig.provider === "string" ? embeddingConfig.provider : "openai",
+            model: typeof embeddingConfig.model === "string" ? embeddingConfig.model : "text-embedding-3-small",
+            workspaceDir,
+            dbPath: agentDbPath(normalizedConfig, agentId),
+            extraPaths: computeExtraPaths(normalizedConfig, workspaceDir),
+            sources: ["memory", "sessions"],
+            custom: {
+              pluginId: api.id,
+              agentId,
+              retrievalMode: retrievalCfg.mode,
+            },
+          };
+        },
+        async sync(params) {
+          params?.progress?.({ completed: 0, total: 1, label: "Flushing memU state" });
+          await runPython("flush.py", [], normalizedConfig, workspaceDir);
+          params?.progress?.({ completed: 1, total: 1, label: "memU flush complete" });
+        },
+        async probeEmbeddingAvailability() {
+          const pyReady = ensurePythonRuntime(normalizedConfig);
+          if (!pyReady.ok) {
+            return { ok: false, error: pyReady.reason || "Python bootstrap failed" };
+          }
+
+          const embeddingConfig = normalizedConfig.embedding || {};
+          const apiKey = await resolveApiKeyWithFallback(
+            embeddingConfig.apiKey,
+            "MEMU_EMBED_API_KEY",
+            "embedding.apiKey"
+          );
+          if (!apiKey) {
+            return { ok: false, error: "Embedding API key is not configured." };
+          }
+          return { ok: true };
+        },
+        async probeVectorAvailability() {
+          return ensurePythonRuntime(normalizedConfig).ok;
+        },
+        async close() {
+          memoryManagerCache.delete(cacheKey);
+        },
+      };
+
+      memoryManagerCache.set(cacheKey, manager);
+      return manager;
+    };
+
+    const memoryRuntime = {
+      async getMemorySearchManager(params: any) {
+        try {
+          return { manager: getMemorySearchManager(params), error: null };
+        } catch (error) {
+          return {
+            manager: null,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+      resolveMemoryBackendConfig(params: any) {
+        const pluginConfig = getPluginConfig(params);
+        const workspaceDir = resolveWorkspaceDir(params);
+        const agentId = resolveAgentId(params);
+        const status = getMemorySearchManager(params).status();
+        return {
+          ...status,
+          workspaceDir,
+          dbPath: agentDbPath(pluginConfig, agentId),
+        };
+      },
+      async closeAllMemorySearchManagers() {
+        for (const manager of memoryManagerCache.values()) {
+          await manager.close?.();
+        }
+        memoryManagerCache.clear();
+      },
+    };
+
     const serializeAgentDirs = (enabledAgents: string[]): string => {
       const dirs = getSessionDirs(enabledAgents);
       const payload: Record<string, string> = {};
@@ -885,7 +1266,7 @@ const memuEnginePlugin = {
 
       const pyReady = ensurePythonRuntime(normalizedConfig);
       if (!pyReady.ok) {
-        console.error(`[memU] Python bootstrap failed: ${pyReady.reason}`);
+        logger.error(`[memU] Python bootstrap failed: ${pyReady.reason}`);
         return;
       }
 
@@ -907,7 +1288,7 @@ const memuEnginePlugin = {
       );
       const chatApiKey = await resolveApiKeyWithFallback(
         extractionConfig.apiKey,
-        "MEMU_CHAT_API_KEY",
+        "NVIDIA_API_KEY",
         "extraction.apiKey"
       );
       
@@ -948,11 +1329,10 @@ const memuEnginePlugin = {
       });
 
       const scriptPath = path.join(pythonRoot, "watch_sync.py");
-      
-      console.log(`[memU] Starting background sync service: ${scriptPath}`);
+      logInfo(`[memU] Starting background sync service: ${scriptPath}`);
       
       // Launch using uv run
-      const proc = spawn("uv", ["run", "--project", pythonRoot, "python", scriptPath], {
+      const proc = spawn(uvBinary, ["run", "--project", pythonRoot, "python", scriptPath], {
         cwd: pythonRoot,
         env,
         stdio: "pipe",
@@ -974,9 +1354,9 @@ const memuEnginePlugin = {
       // Redirect logs to Gateway console (with prefix)
       proc.stdout?.on("data", (d) => {
         const lines = d.toString().trim().split("\n");
-        lines.forEach((l: string) => console.log(`[memU Sync] ${l}`));
+        lines.forEach((l: string) => logInfo(`[memU Sync] ${l}`));
       });
-      proc.stderr?.on("data", (d) => console.error(`[memU Sync Error] ${d}`));
+      proc.stderr?.on("data", (d) => logger.error(`[memU Sync Error] ${d}`));
 
       proc.on("close", (code, signal) => {
         // Ignore stale close events from an old process instance.
@@ -991,19 +1371,19 @@ const memuEnginePlugin = {
         if (isShuttingDown || Date.now() < stopInProgressUntil) return;
 
         if (code === 0 || signal === "SIGTERM" || signal === "SIGINT" || signal === "SIGKILL") {
-          console.log(
+          logInfo(
             `[memU] Sync service exited normally (code ${code ?? "null"}, signal ${signal ?? "none"}).`
           );
           return;
         }
 
         if (code === null && !signal) {
-          console.log("[memU] Sync service exited without code/signal; skip restart.");
+          logInfo("[memU] Sync service exited without code/signal; skip restart.");
           return;
         }
 
         if (!isShuttingDown) {
-          console.warn(`[memU] Sync service crashed (code ${code}). Restarting in 5s...`);
+          logger.warn(`[memU] Sync service crashed (code ${code}). Restarting in 5s...`);
           setTimeout(() => startSyncService(pluginConfig, workspaceDir), 5000);
         }
       });
@@ -1052,7 +1432,7 @@ const memuEnginePlugin = {
             // ignore
           }
         }
-        console.log("[memU] Skipping auto-start for gateway management command.");
+        logInfo("[memU] Skipping auto-start for gateway management command.");
         return;
       }
       
@@ -1076,10 +1456,10 @@ const memuEnginePlugin = {
             }
           }
           
-          console.log(`[memU] Auto-starting sync service for workspace: ${workspaceDir}`);
+          logInfo(`[memU] Auto-starting sync service for workspace: ${workspaceDir}`);
           startSyncService(pluginConfig, workspaceDir);
         } catch (e) {
-          console.error(`[memU] Auto-start failed: ${e}`);
+          logger.error(`[memU] Auto-start failed: ${e}`);
         }
       });
     };
@@ -1104,23 +1484,23 @@ const memuEnginePlugin = {
           const workspaceDir = ctx?.workspaceDir || process.env.OPENCLAW_WORKSPACE_DIR || process.cwd();
           await runPython("flush.py", [], pluginConfig, workspaceDir);
         } catch (e) {
-          console.error(`[memU] after_compaction flush failed: ${e}`);
+          logger.error(`[memU] after_compaction flush failed: ${e}`);
         }
       };
 
       if (typeof apiAny.on === "function") {
         apiAny.on(hookName, handler, { priority: -10 });
-        console.log(`[memU] Registered hook: ${hookName} (flushOnCompaction=true)`);
+        logInfo(`[memU] Registered hook: ${hookName} (flushOnCompaction=true)`);
         return;
       }
 
       if (typeof apiAny.registerHook === "function") {
         apiAny.registerHook(hookName, handler, { name: "memu-engine:after_compaction_flush" });
-        console.log(`[memU] Registered hook via registerHook: ${hookName} (flushOnCompaction=true)`);
+        logInfo(`[memU] Registered hook via registerHook: ${hookName} (flushOnCompaction=true)`);
         return;
       }
 
-      console.warn("[memU] Hook API not available; cannot enable flushOnCompaction");
+      logger.warn("[memU] Hook API not available; cannot enable flushOnCompaction");
     };
     
     // ---------------------------------------------------------
@@ -1157,7 +1537,7 @@ const memuEnginePlugin = {
       );
       const chatApiKey = await resolveApiKeyWithFallback(
         extractionConfig.apiKey,
-        "MEMU_CHAT_API_KEY",
+        "NVIDIA_API_KEY",
         "extraction.apiKey"
       );
       
@@ -1200,7 +1580,7 @@ const memuEnginePlugin = {
       });
 
       return new Promise((resolve) => {
-        const proc = spawn("uv", ["run", "--project", pythonRoot, "python", path.join(pythonRoot, "scripts", scriptName), ...args], {
+        const proc = spawn(uvBinary, ["run", "--project", pythonRoot, "python", path.join(pythonRoot, "scripts", scriptName), ...args], {
           cwd: pythonRoot,
           env
         });
@@ -1219,6 +1599,18 @@ const memuEnginePlugin = {
 
     // Register hooks after helpers are available.
     registerCompactionFlushHook();
+
+    if (typeof apiAny.registerMemoryPromptSection === "function") {
+      apiAny.registerMemoryPromptSection(buildMemoryPromptSection);
+    } else {
+      logger.warn("[memU] Memory prompt section API is not available; continuing without prompt-section registration.");
+    }
+
+    if (typeof apiAny.registerMemoryRuntime === "function") {
+      apiAny.registerMemoryRuntime(memoryRuntime);
+    } else {
+      logger.warn("[memU] Memory runtime API is not available; continuing with tool-only compatibility mode.");
+    }
 
     const searchSchema = {
       type: "object",
@@ -1252,7 +1644,8 @@ const memuEnginePlugin = {
     api.registerTool(
       (ctx) => {
         const pluginConfig = getPluginConfig(ctx);
-        const workspaceDir = ctx.workspaceDir || process.cwd();
+        const workspaceDir = resolveWorkspaceDir(ctx);
+        const defaultAgentId = resolveAgentId(ctx);
 
         const searchTool = (name: string, description: string) => ({
           name,
@@ -1294,7 +1687,8 @@ const memuEnginePlugin = {
               args.push("--item-quota", String(retrievalCfg.defaultItemQuota));
             }
             const config = normalizeConfig(pluginConfig);
-            const requestingAgent = typeof agentName === "string" && agentName.trim() ? agentName.trim() : "main";
+            const requestingAgent =
+              typeof agentName === "string" && agentName.trim() ? agentName.trim() : defaultAgentId;
             const defaultPolicy = { memoryEnabled: true, searchEnabled: true, searchableStores: ["self"] as string[] };
             const agentPolicy = config.agentSettings?.[requestingAgent] || defaultPolicy;
 
@@ -1322,7 +1716,7 @@ const memuEnginePlugin = {
             args.push("--requesting-agent", requestingAgent);
             args.push("--search-stores", resolvedStores.join(","));
             if (retrievalCfg.mode === "full") {
-              const sessionDir = getSessionDir();
+              const sessionDir = getSessionDir(requestingAgent);
               const history = getRecentSessionMessages(sessionDir, retrievalCfg.contextMessages);
               contextCount = history.length;
               const queries = [...history, { role: "user" as const, content: query }];
@@ -1459,6 +1853,6 @@ const memuEnginePlugin = {
       { names: ["memu_search", "memory_search", "memu_get", "memory_get", "memory_flush", "memu_flush"] },
     );
   }
-};
+});
 
 export default memuEnginePlugin;

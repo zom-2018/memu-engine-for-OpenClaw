@@ -10,6 +10,8 @@ This document summarizes all configurable parameters currently supported by the 
 - whether each field is optional
 - precedence/override rules
 
+> The native OpenClaw manifest is strict now: `openclaw.plugin.json` is treated as the authoritative schema for supported plugin keys.
+
 > After editing `~/.openclaw/openclaw.json`, run:
 >
 > `openclaw gateway restart`
@@ -59,7 +61,7 @@ Location:
 Fields:
 
 - `embedding.provider` (string)
-- `embedding.apiKey` (string | SecretRef) - **Supports SecretRef since v0.2.6**
+- `embedding.apiKey` (string | SecretRef) - supports `${VAR}` templates and env-backed SecretRef objects
 - `embedding.baseUrl` (string)
 - `embedding.model` (string)
 
@@ -86,7 +88,7 @@ The `apiKey` field supports three formats:
    }
    ```
    - Equivalent to `${VAR}` syntax
-   - Currently only `env` source is supported
+   - The plugin resolves `env`-backed SecretRefs directly
 
 3. **Plain Text** (not recommended):
    ```json
@@ -95,7 +97,7 @@ The `apiKey` field supports three formats:
    - Shows security warning on startup
    - Risk of leaking if committed to git
 
-**Environment Variable Fallback**: If `apiKey` is not configured, automatically falls back to `MEMU_EMBED_API_KEY` environment variable.
+**Environment Variable Fallback**: If `apiKey` is not configured, the runtime falls back to `MEMU_EMBED_API_KEY`.
 
 ---
 
@@ -112,7 +114,7 @@ The `apiKey` field supports three formats:
 Fields:
 
 - `extraction.provider` (string)
-- `extraction.apiKey` (string | SecretRef) - **Supports SecretRef since v0.2.6**
+- `extraction.apiKey` (string | SecretRef) - supports `${VAR}` templates and env-backed SecretRef objects
 - `extraction.baseUrl` (string)
 - `extraction.model` (string)
 
@@ -120,9 +122,9 @@ Used by memory extraction and full-mode decision checks.
 
 #### API Key Configuration (v0.2.6+)
 
-Same as `embedding.apiKey` - supports environment variable template syntax, full SecretRef objects, and plain text. See section 1.2 for details.
+Same as `embedding.apiKey` - supports environment variable template syntax, env-backed SecretRef objects, and plain text. See section 1.2 for details.
 
-**Environment Variable Fallback**: If `apiKey` is not configured, automatically falls back to `MEMU_CHAT_API_KEY` environment variable.
+**Environment Variable Fallback**: If `apiKey` is not configured, the runtime falls back to `MEMU_CHAT_API_KEY`.
 
 ---
 
@@ -281,6 +283,15 @@ In `plugin` mode, memu-engine injects both uppercase and lowercase proxy env nam
 - **Used when**: `network.proxy.mode = "plugin"`
 - **Meaning**: value injected as `NO_PROXY`
 
+#### `config.dataDir`
+
+- **Type**: `string`
+- **Optional**: Yes
+- **Default**: `~/.openclaw/memUdata`
+- **Meaning**: root directory for runtime state, session conversion artifacts, and sync bookkeeping.
+
+The runtime resolves `config.dataDir` first, then the `MEMU_DATA_DIR` environment variable, and finally defaults to `~/.openclaw/memUdata`.
+
 Example:
 
 ```json
@@ -313,7 +324,9 @@ Example:
 - **Type**: `string`
 - **Optional**: Yes
 - **Default**: `"default"` (or env fallback)
-- **Meaning**: user namespace for memory isolation.
+- **Meaning**: user namespace for memory isolation and per-user search routing.
+
+The runtime resolves `config.userId` first, then the `MEMU_USER_ID` environment variable, and finally defaults to `"default"`.
 
 #### `config.memoryRoot`
 
@@ -369,7 +382,14 @@ The script consolidates legacy data/state/resources into the unified `~/.opencla
 - **Type**: `boolean`
 - **Optional**: Yes
 - **Default**: `false`
-- **Meaning**: if true, registers compaction hook to run `memory_flush` behavior.
+- **Meaning**: if true, registers the `after_compaction` hook to run `memory_flush` behavior.
+
+#### `config.debugTiming`
+
+- **Type**: `boolean`
+- **Optional**: Yes
+- **Default**: `false`
+- **Meaning**: when true, the search helper emits extra timing details for debugging performance and provider selection.
 
 ---
 
