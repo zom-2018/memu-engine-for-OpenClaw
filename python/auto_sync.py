@@ -593,11 +593,19 @@ async def sync_once(user_id: str = "default") -> None:
         timeout_s = int(_env("MEMU_MEMORIZE_TIMEOUT_SECONDS", "600") or "600")
         base_backoff_s = int(_env("MEMU_RATE_LIMIT_BACKOFF_SECONDS", "60") or "60")
         max_backoff_s = int(_env("MEMU_RATE_LIMIT_BACKOFF_MAX_SECONDS", "900") or "900")
+        max_batch_items = int(_env("MEMU_MAX_INGEST_ITEMS_PER_SYNC", "8") or "8")
+        max_batch_items = max(1, max_batch_items)
         consecutive_rate_limits = int(backoff.get("consecutive_rate_limits", 0) or 0)
         saw_rate_limit = False
 
+        if len(merged) > max_batch_items:
+            _log(
+                f"batch limit active: processing first {max_batch_items} item(s) out of {len(merged)} pending"
+            )
+        ingest_batch = merged[:max_batch_items]
+
         remaining: list[str] = []
-        for p in merged:
+        for idx, p in enumerate(ingest_batch):
             agent_name = current_agent
             if not _agent_memory_enabled(agent_name):
                 _log(f"skip disabled agent memory: {agent_name} ({os.path.basename(p)})")
@@ -636,6 +644,15 @@ async def sync_once(user_id: str = "default") -> None:
                 remaining.append(p)
                 if _is_rate_limited_error(e):
                     saw_rate_limit = True
+                    remaining.extend(ingest_batch[idx + 1 :])
+                    remaining.extend(merged[max_batch_items:])
+                    _log(
+                        "rate limit detected; stopping current ingest batch immediately and deferring remaining items to backoff"
+                    )
+                    break
+
+        if not saw_rate_limit:
+            remaining.extend(merged[max_batch_items:])
 
         for service in services.values():
             try:

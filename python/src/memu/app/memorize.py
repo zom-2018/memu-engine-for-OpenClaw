@@ -1318,6 +1318,15 @@ class MemorizeMixin:
             return []
         raw = raw.strip()
 
+        def _normalize_xml_response(text: str) -> str:
+            normalized = text.strip()
+            normalized = re.sub(r"^\s*```(?:xml)?\s*", "", normalized, flags=re.IGNORECASE)
+            normalized = re.sub(r"\s*```\s*$", "", normalized)
+            normalized = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "", normalized, flags=re.IGNORECASE)
+            normalized = re.sub(r"^\s*Here is the XML:\s*", "", normalized, flags=re.IGNORECASE)
+            normalized = re.sub(r"^\s*XML:\s*", "", normalized, flags=re.IGNORECASE)
+            return normalized.strip()
+
         def _sanitize_xml_text(text: str) -> str:
             return re.sub(r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z][A-Za-z0-9]+;)", "&amp;", text)
 
@@ -1336,6 +1345,7 @@ class MemorizeMixin:
             return parsed_items
 
         try:
+            raw = _normalize_xml_response(raw)
             boundaries = self._find_xml_boundaries(raw)
             if boundaries is None:
                 logger.warning("Could not find valid root tag in XML response")

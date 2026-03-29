@@ -100,6 +100,12 @@ PROMPT_BLOCK_CATEGORY = """
 PROMPT_BLOCK_OUTPUT = """
 # Output Format (XML)
 Return all memories wrapped in a single <item> element:
+Output XML only.
+- Do not add Markdown fences.
+- Do not add explanations before or after the XML.
+- Do not add prose like "Here is the XML".
+- Escape special characters inside text nodes (`&`, `<`, `>`) as XML entities.
+- If there are no valid memories, return exactly `<item></item>`.
 <item>
     <memory>
         <content>Behavior memory item content 1</content>
