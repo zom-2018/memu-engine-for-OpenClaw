@@ -59,7 +59,7 @@ Project references:
 
 ## What's New in This Fork
 
-Current release baseline: `v0.4.0`
+Current release baseline: `v0.4.2`
 
 - Vendored MemU runtime rebased to `v1.5.1`
 - Python baseline raised to `3.13+`
@@ -136,7 +136,7 @@ openclaw plugins install -l /abs/path/to/memu-engine-for-OpenClaw
 After running `npm pack`, install the generated `.tgz`:
 
 ```bash
-openclaw plugins install /abs/path/to/memu-engine-0.4.0.tgz
+openclaw plugins install /abs/path/to/memu-engine-0.4.2.tgz
 ```
 
 ### Restart OpenClaw

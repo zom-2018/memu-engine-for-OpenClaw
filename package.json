@@ -1,6 +1,6 @@
 {
   "name": "memu-engine",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Atomic memory engine for OpenClaw powered by MemU. Features immutable parts for zero redundant token cost.",
   "type": "module",
   "main": "index.ts",
