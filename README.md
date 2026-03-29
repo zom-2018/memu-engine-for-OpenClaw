@@ -1,107 +1,95 @@
 <!-- markdownlint-disable MD013 MD031 MD032 MD033 MD034 MD040 MD004 MD030 MD022 MD007 MD012 MD009 MD025 -->
 # memU Engine for OpenClaw
 
-[![Tests](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/actions/workflows/test.yml/badge.svg)](https://github.com/duxiaoxiong/memu-engine-for-OpenClaw/actions/workflows/test.yml)
+`memu-engine` is a memory plugin for OpenClaw that vendors the MemU Python runtime and exposes it through the OpenClaw memory slot.
 
-Project Links:
+This fork is updated for:
+
+- `memU v1.5.1`
+- Python `3.13+`
+- the current OpenClaw plugin SDK entrypoint style
+- the current OpenClaw memory-plugin runtime contract
+
+Project references:
 
 - OpenClaw: https://github.com/openclaw/openclaw
-- MemU (upstream): https://github.com/NevaMind-AI/MemU
+- MemU upstream: https://github.com/NevaMind-AI/MemU
 
-Language:
+> [!IMPORTANT]
+> This is not a cosmetic fork.
+>
+> This fork rebases the plugin onto `memU v1.5.1`, upgrades the runtime to Python `3.13+`, aligns the plugin with the modern OpenClaw memory-plugin APIs, and adds verified compatibility coverage for older SQLite and storage-layout upgrades.
 
-- [Chinese (中文)](README_ZH.md)
+## Why This Fork Is Better
 
-## Changes in v0.3.1
+### Built for current OpenClaw, not older plugin assumptions
 
-v0.3.1 changes `memu-engine` from a single-store memory plugin into a per-agent memory layout with explicit shared storage and retrieval rules.
+- modern `definePluginEntry(...)` plugin entrypoint
+- registered as a real OpenClaw `memory` runtime, not just a legacy tool bundle
+- strict manifest/schema aligned with the current plugin contract
 
-| Area | v0.2.6 | v0.3.1 |
-| --- | --- | --- |
-| Agent memory | Single `memu.db` | One DB per agent: `memory/<agent>/memu.db` |
-| Shared docs | Mixed into the same store | Dedicated shared store: `memory/shared/memu.db` |
-| Cross-agent retrieval | Legacy coarse switch | Explicit per-agent `searchableStores` policy |
-| Runtime layout | Legacy scattered paths | Unified `~/.openclaw/memUdata` |
-| Upgrade path | Manual reasoning required | Auto migration with backup-first behavior |
+### Updated vendored MemU baseline
 
-### What changed for users
+- vendored upstream rebased to `memU v1.5.1`
+- Python runtime moved to `3.13+`
+- dependency floor updated for the newer MemU runtime
 
-- **Per-agent memory**: each agent writes to its own DB, so memory is isolated by default.
-- **Explicit sharing**: cross-agent retrieval is controlled by `agentSettings.searchableStores`.
-- **Simpler paths**: conversations, resources, memory DBs, and state files live under one root.
-- **Automatic upgrade**: old `v0.2.6` data is migrated to the new layout with backup-first behavior.
+### Safer upgrades for existing users
 
-Useful docs:
+- verified compatibility path for older SQLite memory databases
+- verified migration path for older storage layouts
+- backup-first migration helpers included in-repo
 
-- **[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**: parameter defaults, optional fields, and precedence.
+### Better operational behavior
 
-## Overview
+- cleaner plugin/runtime separation
+- current SecretRef-aware config surface
+- modernized packaging and local release flow
+- packed and installable as a local `.tgz` release artifact
 
-`memu-engine` turns OpenClaw session logs and workspace Markdown into structured, retrievable memory.
+## What This Plugin Does
 
-- It extracts profiles, events, knowledge, skills, and behavior signals from conversations.
-- It stores agent memory locally in SQLite/vector-backed MemU databases.
-- It keeps shared documents separate from agent-private memory.
-- It exposes the result through OpenClaw's memory plugin slot, so agents can call `memory_search` directly.
+`memu-engine` turns OpenClaw session logs and selected workspace Markdown into structured, searchable memory.
 
-It is built on top of MemU's extraction pipeline. See the [MemU upstream project](https://github.com/NevaMind-AI/MemU) for the model and method details.
+- It extracts profiles, events, knowledge, skills, and behavioral signals from conversations.
+- It stores memory locally in SQLite-backed MemU databases.
+- It supports per-agent memory isolation plus a shared document store.
+- It registers as an OpenClaw `memory` plugin, so agents can use `memory_search` and `memory_get`.
+- It keeps compatibility aliases for existing users: `memu_search`, `memu_get`, `memu_flush`.
 
-## Install (Official OpenClaw Flow)
+## What's New in This Fork
 
-### Prerequisites
+Current release baseline: `v0.4.0`
 
-- `uv` available in `PATH` (the plugin auto-bootstraps an isolated Python runtime via `uv sync`)
+- Vendored MemU runtime rebased to `v1.5.1`
+- Python baseline raised to `3.13+`
+- plugin entry moved to `definePluginEntry(...)`
+- memory runtime registered through the modern OpenClaw memory-plugin API
+- strict manifest/schema in [openclaw.plugin.json](openclaw.plugin.json)
+- updated config surface for:
+  - `dataDir`
+  - `userId`
+  - `flushOnCompaction`
+  - `debugTiming`
+  - SecretRef-compatible `embedding.apiKey` and `extraction.apiKey`
+- safer vendoring workflow in [update_from_upstream.sh](update_from_upstream.sh)
+- Telegram topic transcript support for OpenClaw sessions stored as `<session_id>-topic-*.jsonl`
+- more robust runtime bootstrap in mixed shell/systemd environments via logger compatibility fallback plus safer `pythonRoot` and `uv` resolution
 
-> First run auto-bootstrap: the plugin will create/use an isolated environment under `python/.venv` and install locked dependencies from `python/uv.lock`. This applies to both npm install and GitHub source install.
+## Requirements
 
-### 1. Install plugin
+- OpenClaw with plugin support
+- `uv` in `PATH` or exposed via `MEMU_UV_BIN`
+- Python `3.13+`
+- Node `22.14.0+`
 
-Published package:
+On first use, the plugin bootstraps its isolated Python environment under `python/.venv` using the locked dependencies in `python/uv.lock`.
 
-```bash
-openclaw plugins install memu-engine
-```
+## Important OpenClaw Setting
 
-Local dev link:
+If you use `memu-engine` as the memory backend, keep native OpenClaw memory search disabled.
 
-```bash
-openclaw plugins install -l /abs/path/to/memu-engine
-```
-
-### 2. Configure OpenClaw
-
-Edit `~/.openclaw/openclaw.json` under `plugins`.
-
-### 3. Restart and activate
-
-```bash
-openclaw gateway restart
-```
-
-After restarting, just say "Call `memory_search`" to your agent. The background sync service will automatically start and begin the initial full sync.
-
-## Storage Layout
-
-v0.3.1 stores runtime data under one root:
-
-```text
-~/.openclaw/memUdata/
-├── conversations/          # converted session parts
-├── resources/              # ingested document artifacts
-├── memory/
-│   ├── shared/memu.db      # shared document store
-│   ├── main/memu.db        # main agent memory
-│   └── <agent>/memu.db     # other agent memories
-└── state/                  # sync state and bookkeeping
-```
-
-Compared with `v0.2.6`, the layout is easier to inspect, back up, migrate, and clean because each part now has a fixed directory.
-
-If you are upgrading from v0.2.6, the plugin automatically migrates the legacy single-DB layout into the new per-agent layout and keeps a backup before writing.
-
-## Quick Start Configuration
-
-### Minimal single-agent setup
+Do this:
 
 ```jsonc
 {
@@ -113,7 +101,67 @@ If you are upgrading from v0.2.6, the plugin automatically migrates the legacy s
     }
   },
   "plugins": {
-    "slots": { "memory": "memu-engine" },
+    "slots": {
+      "memory": "memu-engine"
+    }
+  }
+}
+```
+
+Do not enable both at the same time:
+
+- OpenClaw native memory: `agents.defaults.memorySearch.enabled = true`
+- `memu-engine` memory slot: `plugins.slots.memory = "memu-engine"`
+
+Running both together gives you two competing memory systems and confusing retrieval behavior.
+
+## Install
+
+If you publish this fork under a different package name, replace `memu-engine` in the commands below with your published package name.
+
+### From a published package
+
+```bash
+openclaw plugins install memu-engine
+```
+
+### From a local checkout
+
+```bash
+openclaw plugins install -l /abs/path/to/memu-engine-for-OpenClaw
+```
+
+### From a locally packed tarball
+
+After running `npm pack`, install the generated `.tgz`:
+
+```bash
+openclaw plugins install /abs/path/to/memu-engine-0.4.0.tgz
+```
+
+### Restart OpenClaw
+
+```bash
+openclaw gateway restart
+```
+
+## Quick Start Configuration
+
+Minimal single-agent setup:
+
+```jsonc
+{
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "enabled": false
+      }
+    }
+  },
+  "plugins": {
+    "slots": {
+      "memory": "memu-engine"
+    },
     "entries": {
       "memu-engine": {
         "enabled": true,
@@ -138,17 +186,25 @@ If you are upgrading from v0.2.6, the plugin automatically migrates the legacy s
 }
 ```
 
-### Minimal multi-agent setup
+Minimal multi-agent setup:
 
 ```jsonc
 {
+  "agents": {
+    "defaults": {
+      "memorySearch": {
+        "enabled": false
+      }
+    }
+  },
   "plugins": {
-    "slots": { "memory": "memu-engine" },
+    "slots": {
+      "memory": "memu-engine"
+    },
     "entries": {
       "memu-engine": {
         "enabled": true,
         "config": {
-          "memoryRoot": "~/.openclaw/memUdata/memory",
           "agentSettings": {
             "main": {
               "memoryEnabled": true,
@@ -168,334 +224,212 @@ If you are upgrading from v0.2.6, the plugin automatically migrates the legacy s
 }
 ```
 
-Reading rule for the example above:
+Behavior in the example above:
 
-- `main` can search its own memory, the shared doc store, and `research` memory.
-- `research` can search only its own memory plus shared docs.
-- Both agents still write into separate DBs.
+- Telegram topics are supported: session transcripts named like `<session_id>-topic-1.jsonl` are discovered and ingested under the owning session ID
+- `main` can search its own memory, the shared store, and `research`
+- `research` can search only itself plus the shared store
+- both agents still write to separate DBs
 
-## Configuration Details
+## Storage Layout
 
-Below is a full configuration example with parameter explanations. If you only want a working setup, use the quick-start example above first and return here for tuning.
+The current runtime layout is:
 
-```jsonc
-{
-  "plugins": {
-    "slots": { "memory": "memu-engine" },
-    "entries": {
-      "memu-engine": {
-        "enabled": true,
-        "config": {
-          // 1. Embedding Model (for search)
-          "embedding": {
-            "provider": "openai",
-            "baseUrl": "https://api.openai.com/v1",
-            "apiKey": "sk-...",
-            "model": "text-embedding-3-small"
-          },
-          // 2. Extraction Model (for summarization)
-          "extraction": {
-            "provider": "openai",
-            "baseUrl": "https://api.openai.com/v1",
-            "apiKey": "sk-...",
-            "model": "gpt-4o-mini"
-          },
-          // 3. Output Language
-          "language": "en",
-          // 4. Memory Root (Optional hybrid storage)
-          "memoryRoot": "~/.openclaw/memUdata/memory",
-          // 5. Ingest Configuration
-          "ingest": {
-            "includeDefaultPaths": true,
-            "extraPaths": [
-              "/home/you/project/docs",
-              "/home/you/project/README.md"
-            ]
-          },
-          // 6. Retrieval Behavior
-          "retrieval": {
-            "mode": "fast",               // fast | full
-            "contextMessages": 3,          // used in full mode
-            "defaultCategoryQuota": 3,     // default category results
-            "defaultItemQuota": 7,         // default item results
-            "outputMode": "compact"       // compact | full
-          },
-          // 7. Performance Optimization (Immutable Parts)
-          "flushIdleSeconds": 1800, // Flush part after 30 mins of inactivity
-          "maxMessagesPerPart": 60,  // Flush part after 60 messages
-          // 8. Multi-agent Memory Policy
-          "agentSettings": {
-            "main": {
-              "memoryEnabled": true,
-              "searchEnabled": true,
-              "searchableStores": ["self", "shared", "trial"]
-            },
-            "trial": {
-              "memoryEnabled": true,
-              "searchEnabled": true,
-              "searchableStores": ["self", "shared"]
-            }
-          },
-          // 9. Document Chunking
-          "chunkSize": 512,      // 1-2048, default 512
-          "chunkOverlap": 50     // >=0, < chunkSize, default 50
-        }
-      }
-    }
-  }
-}
+```text
+~/.openclaw/memUdata/
+├── conversations/
+├── resources/
+├── memory/
+│   ├── shared/memu.db
+│   ├── main/memu.db
+│   └── <agent>/memu.db
+└── state/
 ```
 
-### 1. `embedding` (Embedding Model)
-Configures the model used for generating text vectors, which directly determines search accuracy.
-*   **Recommended**: `text-embedding-3-small` (OpenAI) or `bge-m3` (local/SiliconFlow).
-*   Supports all OpenAI-compatible interfaces.
+This layout is easier to back up, inspect, and migrate than the older mixed layouts.
 
-**API Key Configuration (Recommended):**
+## Upgrade and Compatibility
 
-Use environment variable template syntax - the **safest and most convenient** way:
+This fork includes compatibility work for older `memu-engine` deployments.
+
+### Verified compatibility
+
+The local regression checks validate:
+
+- legacy single SQLite DB migration from `memu.db` into `memory/<agent>/memu.db`
+- preservation of old compatibility columns such as `agentName`
+- creation and population of new `agent_id` columns
+- migration of old flat storage-layout files:
+  - legacy conversations
+  - sync state files
+  - shared resources
+  - older memory root DBs
+
+### Upgrade recommendation
+
+Before replacing an older install:
+
+1. Back up `~/.openclaw/memUdata`
+2. If you are upgrading from an older layout, run the storage migration helper once
+3. Install the new plugin version
+4. Restart OpenClaw
+5. Smoke-test with `memory_search`
+
+### Storage migration helper
+
+```bash
+cd /abs/path/to/memu-engine-for-OpenClaw
+UV_CACHE_DIR=/tmp/memu-engine-uv-cache uv run --project python \
+  python python/scripts/migrate_storage_layout.py --backup
+```
+
+### Vendored upstream update helper
+
+The repository includes a fail-fast vendoring helper:
+
+```bash
+./update_from_upstream.sh
+```
+
+It is pinned to the current upstream baseline and is intended to keep OpenClaw-specific overlays intact while refreshing the vendored MemU runtime.
+
+## Configuration Reference
+
+The full parameter reference lives here:
+
+- [MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)
+
+Highlights:
+
+- `embedding`
+- `extraction`
+- `language`
+- `dataDir`
+- `userId`
+- `memoryRoot`
+- `ingest`
+- `retrieval`
+- `network.proxy`
+- `flushOnCompaction`
+- `debugTiming`
+- `chunkSize`
+- `chunkOverlap`
+- `agentSettings`
+
+Compatibility-only legacy keys still accepted during upgrades:
+
+- `flushIdleSeconds`
+- `maxMessagesPerPart`
+
+These two legacy keys are accepted so older configs continue to validate during upgrade, but the current runtime no longer relies on them.
+
+## API Key Setup
+
+Recommended:
 
 ```jsonc
 "embedding": {
   "provider": "openai",
   "baseUrl": "https://api.openai.com/v1",
-  "apiKey": "${OPENAI_API_KEY}",  // References environment variable
+  "apiKey": "${OPENAI_API_KEY}",
   "model": "text-embedding-3-small"
 }
 ```
 
-**Setup (one-time):**
-```bash
-# Add to your shell config (permanent)
-echo 'export OPENAI_API_KEY="sk-your-actual-key"' >> ~/.bashrc
-source ~/.bashrc
+You can also use the same pattern for `extraction.apiKey`.
 
-# Verify
-echo $OPENAI_API_KEY
-```
+Supported forms:
 
-**Why this is secure:**
-- ✅ Config file only contains variable name `"${OPENAI_API_KEY}"` - safe to commit to git
-- ✅ Actual API key stays in environment variable - never exposed in config files
-- ✅ Different environments (dev/prod) can use different keys
-- ✅ Follows 12-Factor App best practices
+1. `${OPENAI_API_KEY}`
+2. full env-backed SecretRef
+3. plain text string
 
-**Alternative Configuration Methods:**
+Plain text works, but it is not recommended.
 
-<details>
-<summary>Click to expand: Other configuration options</summary>
+## Retrieval Modes
 
-**Full SecretRef Object** (equivalent to `${VAR}` syntax):
-```jsonc
-"apiKey": {
-  "source": "env",
-  "provider": "default",
-  "id": "OPENAI_API_KEY"
-}
-```
+`memory_search` supports two retrieval modes:
 
-**Plain Text** (not recommended, shows security warning):
-```jsonc
-"apiKey": "sk-..."  // ⚠️ Insecure - may leak if committed to git
-```
+- `fast`
+  - lower latency
+  - vector-focused retrieval
+  - no LLM sufficiency checks
+- `full`
+  - passes recent session context
+  - enables MemU route-intention and sufficiency checks
+  - higher latency, richer retrieval behavior
 
-**Environment Variable Fallback** (automatic):
-If no `apiKey` is configured, the plugin automatically reads from `MEMU_EMBED_API_KEY` environment variable.
+Default tool output mode is `compact`.
 
-**Note:** Currently only `env` source is supported. `file` and `exec` sources require full OpenClaw SDK integration.
+## Local / OpenAI-Compatible Providers
 
-</details>
+If your provider exposes an OpenAI-compatible `/v1` interface, you can use it for both embedding and extraction.
 
-### 2. `extraction` (Extraction Model)
-Configures the LLM used for reading conversation logs and extracting memory items.
-*   **Recommended**: Since it needs to process large amounts of chunked data, use **fast and cheap** models like `gpt-4o-mini` or `gemini-1.5-flash`.
-*   **Note**: This model is primarily for classification and summarization; speed is more important than reasoning capability.
-*   **Tip**: Prefer non-reasoning models that return strict XML-only output (no thinking text or Markdown).
-
-### 3. `language` (Output Language)
-Specifies the language for generated memory summaries.
-*   **Options**: `zh` (Chinese), `en` (English), `ja` (Japanese).
-*   **Suggestion**: Set to the same language as your daily conversations to improve memory recognition rates.
-
-### 4. `memoryRoot` (Hybrid storage layout)
-Defines the root directory where the runtime keeps all agent-specific memories alongside a shared document store.
-*   **Default**: `~/.openclaw/memUdata/memory`
-*   **Usage**: Each configured agent gets its own subdirectory containing `memu.db`, while a `shared/` subdirectory hosts the document database and chunks that all agents can reference.
-*   **High-level structure** (names are illustrative, not enforced filenames):
-    ```
-    {memoryRoot}/
-    ├── shared/            # Shared document store (documents + chunks)
-    │   └── memu.db
-    ├── main/              # Agent-specific memory store
-    │   └── memu.db
-    └── <agentName>/       # Additional agents use the same pattern
-        └── memu.db
-    ```
-*   **Migration**: On startup the plugin checks for the legacy single-DB layout (e.g., `~/.openclaw/memUdata/memu.db`). If it exists, `watch_sync.py`/`auto_sync.py` move data into `memoryRoot/<agent>/memu.db` (defaulting to `main`) and keep a backup of the legacy file.
-
-### 5. `ingest` (Document Ingest)
-Configures which additional Markdown documents to ingest besides session logs.
-
-*   **`includeDefaultPaths`** (bool): Whether to include default workspace docs (`workspace/*.md` and `memory/*.md`). Default is `true`.
-*   **`extraPaths`** (list): List of extra document sources.
-    *   Supports file paths (must be `.md`).
-    *   Supports directory paths (recursively scans all `*.md` files).
-    *   **Limitation**: Currently restricted to Markdown format only.
-
-### 6. `retrieval` (Search behavior)
-
-Controls how `memory_search` behaves.
-
-*   **`mode`**: `fast` (lower latency) or `full` (MemU progressive decision path).
-*   **`contextMessages`**: how many recent chat messages to inject in `full` mode.
-*   **`defaultCategoryQuota` / `defaultItemQuota`**: default category/item counts when tool call does not pass quotas.
-*   **`outputMode`**: `compact` (model-facing minimal fields) or `full` (full envelope with score/model metadata).
-
-> Full details, defaults, and precedence rules: **[MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)**
-
-### 6.1 Agent settings
-
-`agentSettings` replaces the old `enabledAgents`/`allowCrossAgentRetrieval` knobs and lets you define per-agent policies directly in `openclaw.json`.
-
-*   **`memoryEnabled`** (bool, default `true`): enable writing and updating structured memory for this agent.
-*   **`searchEnabled`** (bool, default `true`): allow the agent to issue `memory_search` calls.
-*   **`searchableStores`** (array of `self`, `shared`, or explicit agent names, default `['self']`): controls which agent stores are searchable when this agent runs `memory_search`. `self` is automatically replaced with the requesting agent name.
-
-If a caller omits `agentName` when invoking `memory_search`, the runtime assumes `main` and still respects the agent's `agentSettings` entry. Search results always include `agentName`, so you can tell which agent produced each memory record, even if retrieval spans multiple stores.
-
-Set `agentSettings` under `plugins.entries["memu-engine"].config` to match your workspace agents and trust boundaries. The runtime also ensures `main` is always enabled, even if it is not declared.
-
-Example: enable `trial` memory, let `main` search `trial` + shared docs, and keep `trial` restricted to self + shared docs:
-
-```jsonc
-"agentSettings": {
-  "main": {
-    "memoryEnabled": true,
-    "searchEnabled": true,
-    "searchableStores": ["self", "shared", "trial"]
-  },
-  "trial": {
-    "memoryEnabled": true,
-    "searchEnabled": true,
-    "searchableStores": ["self", "shared"]
-  }
-}
-```
-
-Behavior for this example:
-- `main`: can search own memory + `trial` memory + `shared` document store.
-- `trial`: can search own memory + `shared` document store only.
-
-### 7. Performance Optimization (Immutable Parts)
-This plugin uses an "Immutable Parts" strategy to prevent repeated token consumption.
-
-*   **`flushIdleSeconds`** (int): Default `1800` (30 mins). If a session is idle for this long, the staged chat tail (`.tail.tmp`) is "frozen" into a permanent part and written to MemU.
-*   **`maxMessagesPerPart`** (int): Default `60`. If chat accumulates 60 messages, it forces a freeze.
-
-### 8. Document Chunking
-Controls how ingestion divides documents into retrievable parts.
+Example:
 
 ```jsonc
 {
-  "chunkSize": 512,      // 1-2048, default 512
-  "chunkOverlap": 50     // >=0, < chunkSize, default 50
+  "embedding": {
+    "provider": "openai",
+    "baseUrl": "http://127.0.0.1:8000/v1",
+    "apiKey": "${LOCAL_LLM_API_KEY}",
+    "model": "text-embedding-3-small"
+  },
+  "extraction": {
+    "provider": "openai",
+    "baseUrl": "http://127.0.0.1:8000/v1",
+    "apiKey": "${LOCAL_LLM_API_KEY}",
+    "model": "gpt-4o-mini"
+  }
 }
 ```
-
-**Parameters**:
-*   `chunkSize`: Maximum characters per chunk (1-2048)
-*   `chunkOverlap`: Overlap between consecutive chunks (must be < chunkSize)
-
-**Recommendation**: The defaults (chunkSize=512, chunkOverlap=50) suit most documents. Increase chunkSize for longer context windows or reduce chunkOverlap when you want more distinct splits.
-
----
-
-## Local Model Support
-
-If your local inference service (vLLM, Ollama, LM Studio, etc.) exposes an OpenAI-compatible `/v1` interface:
-
-*   `provider`: `openai`
-*   `baseUrl`: `http://127.0.0.1:PORT/v1`
-*   `apiKey`: `your-api-key` (cannot be empty)
-*   `model`: `<local-model-name>`
-
----
-
-## Technical Principles
-
-<details>
-<summary>Click to expand: Plugin Conversation Ingestion Logic</summary>
-
-1.  **Tail Staging**:
-    *   Your latest chat content is first written to a **temporary file**: `{sessionId}.tail.tmp.json`.
-    *   **MemU completely ignores this file**. So no matter how much you chat, MemU is not triggered, costing 0 tokens.
-
-2.  **Commit & Finalize**:
-    *   Only when **Commit conditions** are met (60 messages or 30 mins idle), the script **renames** the `.tmp` file to a formal `partNNN.json`.
-
-3.  **One-Time Ingestion**:
-    *   memu-engine detects the new `partNNN.json`.
-    *   It reads once, analyzes once, and stores in the database.
-    *   Since this part is "full", it will never be modified again. memu-engine never needs to read it again.
-
-</details>
-
-<details>
-<summary>Click to expand: Session Content Cleaning</summary>
-
-### Session Sanitization
-Before sending to LLM, the plugin deeply cleans raw logs:
-
-1.  **Agent-Scoped Session Locking**: Tracks sessions per configured agent policy (`agentSettings`) and writes memory with `agentName` scope.
-2.  **De-noising**: Removes `NO_REPLY`, `System:` prompts, Tool Calls, and other non-normal conversation content.
-3.  **Anonymization**: Removes `message_id`, Telegram IDs, and other metadata, keeping only plain text.
-
-### Privacy
-All data is stored in local SQLite (`memu.db`).
-*   No data is sent to the cloud (unless you configure a cloud LLM).
-*   You can reset memory at any time by deleting the `~/.openclaw/memUdata` directory.
-
-</details>
-
----
 
 ## Troubleshooting
 
-### Official Memory System Conflict
+### `uv` not found
 
-If `agents.defaults.memorySearch.enabled=true` and `plugins.slots.memory="memu-engine"` are both active, OpenClaw official memory and memu-engine run at the same time.
-This dual-memory setup can cause confusing retrieval behavior.
+Install `uv` first:
 
-**Recommended fix**: keep memu-engine as the only memory backend and disable official memory search.
+https://docs.astral.sh/uv/
 
-Exact `openclaw.json` change:
+### Python bootstrap fails
+
+Check:
+
+- Python `3.13+` is available
+- your network/proxy settings allow dependency downloads
+- `network.proxy` is configured correctly if you need custom proxy behavior
+
+### Memory conflict in OpenClaw
+
+If memory results look duplicated or inconsistent, confirm that native OpenClaw memory is still disabled:
 
 ```jsonc
-{
-  "agents": {
-    "defaults": {
-      "memorySearch": {
-        "enabled": false
-      }
-    }
-  },
-  "plugins": {
-    "slots": {
-      "memory": "memu-engine"
+"agents": {
+  "defaults": {
+    "memorySearch": {
+      "enabled": false
     }
   }
 }
 ```
 
-## Disable and Uninstall
+### Migration caution
 
-### Temporary Disable
-Remove or comment out the `memu-engine` configuration in `openclaw.json`.
+If you are upgrading from an older layout, do not rely only on changing the plugin files in place.
 
-### Full Uninstall
-1. Delete plugin directory: `rm -rf ~/.openclaw/extensions/memu-engine`
-2. Delete data: `rm -rf ~/.openclaw/memUdata`
-3. Restart OpenClaw.
+Run the migration helper first if you have any of these:
+
+- old flat conversations
+- old `last_sync_ts` / `pending_ingest.json`
+- old memory DBs outside `~/.openclaw/memUdata/memory`
+
+## Development Notes
+
+- vendored upstream baseline tracking: [python/UPSTREAM.md](python/UPSTREAM.md)
+- plugin manifest: [openclaw.plugin.json](openclaw.plugin.json)
+- local parameter reference: [MEMU_PARAMETERS.md](MEMU_PARAMETERS.md)
 
 ## License
+
 Apache License 2.0
