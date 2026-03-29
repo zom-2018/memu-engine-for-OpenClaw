@@ -225,20 +225,31 @@ async def search(
         extra_paths = []
 
     candidates: list[Candidate] = []
+    store_errors: list[dict[str, str]] = []
 
     for target in targets:
         if target == "shared":
             continue
-        cats, items, resource_map = await _search_agent_store(
-            agent_name=target,
-            query_text=query_text,
-            user_id=user_id,
-            mode=mode,
-            max_results=max_results,
-            queries=effective_queries,
-            chat_config=chat_config,
-            embed_config=embed_config,
-        )
+        try:
+            cats, items, resource_map = await _search_agent_store(
+                agent_name=target,
+                query_text=query_text,
+                user_id=user_id,
+                mode=mode,
+                max_results=max_results,
+                queries=effective_queries,
+                chat_config=chat_config,
+                embed_config=embed_config,
+            )
+        except Exception as exc:
+            store_errors.append(
+                {
+                    "store": target,
+                    "kind": "agent",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
         for c in cats:
             score = float(c.get("score", 0.0) or 0.0)
             if score < min_score:
@@ -276,31 +287,40 @@ async def search(
             )
 
     if "shared" in targets:
-        manager = HybridDatabaseManager(
-            config=MemUConfig(),
-            db_config=DatabaseConfig(metadata_store=MetadataStoreConfig(provider="sqlite", dsn=agent_db_dsn(requesting_agent))),
-            user_model=AgentScopeModel,
-        )
         try:
-            docs = manager.search_shared_documents(query=query_text, owner_filter=None)
-        finally:
-            manager.close()
-        for d in docs:
-            score = float(d.get("score", 0.0) or 0.0)
-            if score < min_score:
-                continue
-            doc_id = str(d.get("document_id") or "unknown")
-            chunk_id = str(d.get("chunk_index") or "0")
-            candidates.append(
-                Candidate(
-                    uid=f"shared:doc:{d.get('id')}",
-                    store="shared",
-                    source="document",
-                    path=f"memu://shared/document/{doc_id}#chunk-{chunk_id}",
-                    snippet=str(d.get("content", "") or ""),
-                    raw_score=score,
-                    agent_name="shared",
+            manager = HybridDatabaseManager(
+                config=MemUConfig(),
+                db_config=DatabaseConfig(metadata_store=MetadataStoreConfig(provider="sqlite", dsn=agent_db_dsn(requesting_agent))),
+                user_model=AgentScopeModel,
+            )
+            try:
+                docs = manager.search_shared_documents(query=query_text, owner_filter=None)
+            finally:
+                manager.close()
+            for d in docs:
+                score = float(d.get("score", 0.0) or 0.0)
+                if score < min_score:
+                    continue
+                doc_id = str(d.get("document_id") or "unknown")
+                chunk_id = str(d.get("chunk_index") or "0")
+                candidates.append(
+                    Candidate(
+                        uid=f"shared:doc:{d.get('id')}",
+                        store="shared",
+                        source="document",
+                        path=f"memu://shared/document/{doc_id}#chunk-{chunk_id}",
+                        snippet=str(d.get("content", "") or ""),
+                        raw_score=score,
+                        agent_name="shared",
+                    )
                 )
+        except Exception as exc:
+            store_errors.append(
+                {
+                    "store": "shared",
+                    "kind": "shared",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
             )
 
     fused = _rrf_fuse(candidates)
@@ -371,6 +391,7 @@ async def search(
             "targets": targets,
             "candidate_count": len(candidates),
             "fused_count": len(fused),
+            "store_errors": store_errors,
         }
     return payload
 
