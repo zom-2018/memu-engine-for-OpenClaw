@@ -68,10 +68,12 @@ class ConvertSessionsRegressionTests(unittest.TestCase):
             "OPENCLAW_SESSIONS_DIR": os.environ.get("OPENCLAW_SESSIONS_DIR"),
             "MEMU_DATA_DIR": os.environ.get("MEMU_DATA_DIR"),
             "MEMU_MAX_MESSAGES_PER_SESSION": os.environ.get("MEMU_MAX_MESSAGES_PER_SESSION"),
+            "MEMU_IGNORE_SESSION_ID_PATTERNS": os.environ.get("MEMU_IGNORE_SESSION_ID_PATTERNS"),
         }
         os.environ["OPENCLAW_SESSIONS_DIR"] = str(self.sessions_dir)
         os.environ["MEMU_DATA_DIR"] = str(self.data_dir)
         os.environ["MEMU_MAX_MESSAGES_PER_SESSION"] = "50"
+        os.environ.pop("MEMU_IGNORE_SESSION_ID_PATTERNS", None)
 
         if "convert_sessions" in sys.modules:
             self.convert_sessions = importlib.reload(sys.modules["convert_sessions"])
@@ -173,6 +175,43 @@ class ConvertSessionsRegressionTests(unittest.TestCase):
         basenames = sorted(Path(path).name for path in converted)
 
         self.assertEqual(basenames, [f"{session_id}.part000.json"])
+
+    def test_discovery_can_ignore_probe_sessions_by_session_id_pattern(self) -> None:
+        os.environ["MEMU_IGNORE_SESSION_ID_PATTERNS"] = json.dumps([r"^probe-"])
+        self.convert_sessions = importlib.reload(self.convert_sessions)
+
+        _write_json(
+            self.sessions_dir / "sessions.json",
+            {
+                "agent:main:telegram:topic:1": {
+                    "sessionId": "real-session",
+                    "updatedAt": 1774816800000,
+                },
+                "agent:main:probe:zai": {
+                    "sessionId": "probe-zai-123",
+                    "updatedAt": 1774816800001,
+                },
+            },
+        )
+        _write_jsonl(
+            self.sessions_dir / "real-session.jsonl",
+            "real-session",
+            [("user", "keep me"), ("assistant", "kept")],
+        )
+        _write_jsonl(
+            self.sessions_dir / "probe-zai-123.jsonl",
+            "probe-zai-123",
+            [("user", "ignore me"), ("assistant", "ignored")],
+        )
+
+        discovered = self.convert_sessions.discover_all_session_files(
+            str(self.sessions_dir), ["main"]
+        )
+
+        self.assertEqual(
+            discovered["main"],
+            [str(self.sessions_dir / "real-session.jsonl")],
+        )
 
 
 if __name__ == "__main__":

@@ -1318,6 +1318,14 @@ const memuEnginePlugin = definePluginEntry({
         OPENCLAW_SESSIONS_DIR: sessionDir,
         MEMU_FILTER_SCHEDULED_SYSTEM_MESSAGES:
           ingestConfig.filterScheduledSystemMessages === false ? "false" : "true",
+        MEMU_IGNORE_SESSION_ID_PATTERNS: Array.isArray(ingestConfig.ignoreSessionIdPatterns)
+          ? JSON.stringify(
+              ingestConfig.ignoreSessionIdPatterns.filter(
+                (value: unknown): value is string =>
+                  typeof value === "string" && value.trim().length > 0
+              )
+            )
+          : "[]",
         MEMU_SCHEDULED_SYSTEM_MODE:
           typeof ingestConfig.scheduledSystemMode === "string"
             ? ingestConfig.scheduledSystemMode
@@ -1569,6 +1577,14 @@ const memuEnginePlugin = definePluginEntry({
         MEMU_CHUNK_OVERLAP: String(normalizedConfig.chunkOverlap),
         MEMU_FILTER_SCHEDULED_SYSTEM_MESSAGES:
           ingestConfig.filterScheduledSystemMessages === false ? "false" : "true",
+        MEMU_IGNORE_SESSION_ID_PATTERNS: Array.isArray(ingestConfig.ignoreSessionIdPatterns)
+          ? JSON.stringify(
+              ingestConfig.ignoreSessionIdPatterns.filter(
+                (value: unknown): value is string =>
+                  typeof value === "string" && value.trim().length > 0
+              )
+            )
+          : "[]",
         MEMU_SCHEDULED_SYSTEM_MODE:
           typeof ingestConfig.scheduledSystemMode === "string"
             ? ingestConfig.scheduledSystemMode

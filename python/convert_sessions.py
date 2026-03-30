@@ -123,6 +123,49 @@ def _get_language_prefix() -> str | None:
     return f"[Language Context: All memory summaries extracted from this conversation must be written in {lang}.]"
 
 
+def _compile_ignore_session_id_patterns() -> list[re.Pattern[str]]:
+    raw = os.getenv("MEMU_IGNORE_SESSION_ID_PATTERNS", "").strip()
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "invalid MEMU_IGNORE_SESSION_ID_PATTERNS JSON; ignoring session-id filters "
+            f"({exc})"
+        )
+        return []
+
+    if not isinstance(parsed, list):
+        logger.warning(
+            "invalid MEMU_IGNORE_SESSION_ID_PATTERNS type; expected JSON array of regex strings"
+        )
+        return []
+
+    patterns: list[re.Pattern[str]] = []
+    for value in parsed:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            patterns.append(re.compile(value))
+        except re.error as exc:
+            logger.warning(
+                "invalid session-id ignore regex; skipping "
+                f"{value!r} ({exc})"
+            )
+    return patterns
+
+
+IGNORE_SESSION_ID_PATTERNS = _compile_ignore_session_id_patterns()
+
+
+def _should_ignore_session_id(session_id: str) -> bool:
+    if not session_id:
+        return False
+    return any(pattern.search(session_id) for pattern in IGNORE_SESSION_ID_PATTERNS)
+
+
 def discover_session_files(data_root: str | Path, agents: list[str]) -> dict[str, str]:
     discovered = discover_all_session_files(data_root, agents)
     return {
@@ -207,7 +250,11 @@ def discover_all_session_files(
             if not isinstance(session_id, str):
                 continue
             resolved = session_id.strip()
-            if not resolved or resolved in seen:
+            if (
+                not resolved
+                or resolved in seen
+                or _should_ignore_session_id(resolved)
+            ):
                 continue
             seen.add(resolved)
             out.append(resolved)
