@@ -18,6 +18,7 @@ python/.venv/
 *.egg-info/
 dist/
 build/
+memu-engine-*.tgz
 
 # Node.js
 node_modules/
