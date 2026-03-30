@@ -123,6 +123,12 @@
             "default": [],
             "description": "Extra directories/files to ingest Markdown from."
           },
+          "ignoreSessionIdPatterns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "Regex patterns for session IDs that memu-engine should skip during conversation discovery. Useful for excluding synthetic probe sessions such as probe-*."
+          },
           "filterScheduledSystemMessages": {
             "type": "boolean",
             "default": true,
