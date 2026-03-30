@@ -46,6 +46,12 @@ Project references:
 - current SecretRef-aware config surface
 - modernized packaging and local release flow
 - packed and installable as a local `.tgz` release artifact
+- topic-aware OpenClaw session discovery, including Telegram threads stored as `<session_id>-topic-*.jsonl`
+- more resilient background sync under provider pressure via bounded ingest batches and rate-limit backoff
+- safer archived-session handling for `.deleted`, `.reset`, and `.bak` transcripts
+- fail-soft multi-store search so one broken agent/shared store does not blank the whole response
+- stronger malformed XML recovery during extraction instead of silently losing all candidate memories
+- substantially better regression coverage for sync, archived sessions, search orchestration, and XML recovery paths
 
 ## What This Plugin Does
 
@@ -75,6 +81,22 @@ Current release baseline: `v0.4.2`
 - safer vendoring workflow in [update_from_upstream.sh](update_from_upstream.sh)
 - Telegram topic transcript support for OpenClaw sessions stored as `<session_id>-topic-*.jsonl`
 - more robust runtime bootstrap in mixed shell/systemd environments via logger compatibility fallback plus safer `pythonRoot` and `uv` resolution
+- archived-session recovery support for `.jsonl.deleted.*`, `.jsonl.reset.*`, and `.jsonl.bak*` transcripts
+- force-flush behavior for archived transcripts so recovered sessions produce finalized parts instead of stranded tails
+- sync hardening for large backlogs:
+  - bounded ingest batches
+  - stop-on-first-429 behavior
+  - persisted retry/backoff state
+- extraction hardening for imperfect model output:
+  - XML fence/preamble normalization
+  - malformed XML recovery from individual `<memory>` blocks
+- fail-soft multi-store search orchestration with deterministic tests around store policy, dedupe, and shared-store fallback
+- expanded regression suite covering:
+  - topic transcript discovery
+  - archived-session numbering continuity
+  - since-ts edge cases for newly discovered sessions
+  - rate-limit backoff behavior
+  - malformed XML recovery
 
 ## Requirements
 
