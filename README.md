@@ -127,7 +127,17 @@ openclaw plugins install memu-engine
 
 ### From a local checkout
 
+If you cloned or downloaded the repository sources and want to install the plugin directly from that working tree, you do not need to build or install a `.tgz` first:
+
 ```bash
+# from anywhere on the machine
+openclaw plugins install -l /abs/path/to/memu-engine-for-OpenClaw
+```
+
+Example:
+
+```bash
+git clone https://github.com/zom-2018/memu-engine-for-OpenClaw.git
 openclaw plugins install -l /abs/path/to/memu-engine-for-OpenClaw
 ```
 
